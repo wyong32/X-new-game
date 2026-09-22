@@ -255,7 +255,8 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
             <button
               type="button"
               onClick={handleReSeed}
-              disabled={reseeding}
+              disabled={reseeding || mode === 'live'}
+              title={mode === 'live' ? 'Disabled in LIVE mode to protect production data' : 'Reset & Re-Seed Mock Pipeline'}
               className="flex items-center space-x-1.5 px-3 py-2 bg-slate-800 hover:bg-slate-700 text-slate-300 border border-slate-700 rounded transition-colors text-xs disabled:opacity-50"
             >
               <RotateCcw className={`w-3.5 h-3.5 ${reseeding ? 'animate-spin' : ''}`} />

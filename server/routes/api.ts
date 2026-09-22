@@ -1,6 +1,6 @@
 import { Router, Request, Response } from 'express';
 import { store } from '../db/store.js';
-import { runQuery, type RunQueryResult } from '../services/queryRunner.js';
+import { runQuery, runBatchQueries, type RunQueryResult } from '../services/queryRunner.js';
 import {
   computeCandidateScore,
   determineCandidateStatus
@@ -12,7 +12,11 @@ import {
   createSession,
   invalidateSession,
   isValidSession,
-  parseCookie
+  parseCookie,
+  getClientIp,
+  checkRateLimit,
+  recordFailedLogin,
+  resetFailedLogin
 } from '../services/auth.js';
 import type {
   XPost,
@@ -28,27 +32,45 @@ import type {
 export const apiRouter = Router();
 
 // =================================================================
-// 0. AUTHENTICATION (P0 SECURITY GUARD)
+// 0. AUTHENTICATION (P0 SECURITY GUARD - HTTPONLY COOKIE ONLY)
 // =================================================================
 
 apiRouter.post('/auth/login', (req: Request, res: Response) => {
+  const ip = getClientIp(req);
+  const rateLimit = checkRateLimit(ip);
+  if (!rateLimit.allowed) {
+    const minutesLeft = Math.ceil((rateLimit.remainingLockMs || 0) / 60000);
+    return res.status(429).json({
+      success: false,
+      error: `Too many failed login attempts. Please try again in ${minutesLeft} minute(s).`
+    });
+  }
+
   const { password } = req.body;
   const expected = getAppPassword();
 
-  if (!password || password !== expected) {
+  // P0-5: APP_PASSWORD must have NO fallback; if empty, always reject
+  if (!expected || expected.trim() === '' || !password || password !== expected) {
+    recordFailedLogin(ip);
     return res.status(401).json({ success: false, error: 'Invalid lab password' });
   }
 
+  resetFailedLogin(ip);
   const token = createSession();
+  const isProd = process.env.NODE_ENV === 'production';
+
+  // P0-5: HttpOnly cookie session only, strict sameSite, secure in production
   res.cookie('lab_session', token, {
     httpOnly: true,
-    sameSite: 'lax',
+    secure: isProd,
+    sameSite: 'strict',
+    path: '/',
     maxAge: 7 * 24 * 60 * 60 * 1000 // 7 days
   });
 
+  // P0-5: Do NOT return auth token in JSON!
   res.json({
     success: true,
-    token,
     message: 'Authenticated successfully'
   });
 });
@@ -63,29 +85,26 @@ apiRouter.post('/auth/logout', (req: Request, res: Response) => {
     invalidateSession(authHeader.substring(7).trim());
   }
 
-  res.clearCookie('lab_session');
+  res.clearCookie('lab_session', { path: '/' });
   res.json({ success: true, message: 'Logged out successfully' });
 });
 
 apiRouter.get('/auth/status', (req: Request, res: Response) => {
   let authenticated = false;
 
-  const authHeader = req.headers.authorization;
-  if (authHeader && authHeader.startsWith('Bearer ')) {
-    authenticated = isValidSession(authHeader.substring(7).trim());
+  const cookies = parseCookie(req.headers.cookie);
+  if (cookies.lab_session && isValidSession(cookies.lab_session)) {
+    authenticated = true;
   }
 
   if (!authenticated) {
-    const cookies = parseCookie(req.headers.cookie);
-    if (cookies.lab_session) {
-      authenticated = isValidSession(cookies.lab_session);
+    const authHeader = req.headers.authorization;
+    if (authHeader && authHeader.startsWith('Bearer ')) {
+      authenticated = isValidSession(authHeader.substring(7).trim());
     }
   }
 
-  if (!authenticated && typeof req.query.auth_token === 'string') {
-    authenticated = isValidSession(req.query.auth_token);
-  }
-
+  // P0-5: auth_token query parameter support is STRICTLY removed
   res.json({ authenticated });
 });
 
@@ -96,11 +115,11 @@ apiRouter.use(authGuard);
 // 1. APP STATUS & OVERVIEW
 // =================================================================
 
-apiRouter.get('/status', (req: Request, res: Response) => {
-  const settings = store.getSettings();
-  const queries = store.getQueries();
-  const posts = store.getPosts();
-  const candidates = store.getCandidates();
+apiRouter.get('/status', async (req: Request, res: Response) => {
+  const settings = await store.getSettings();
+  const queries = await store.getQueries();
+  const posts = await store.getPosts();
+  const candidates = await store.getCandidates();
 
   const passedPosts = posts.filter(p => p.hard_filter_status === 'PASSED');
   const highConf = candidates.filter(c => c.candidate_score >= 80);
@@ -164,12 +183,12 @@ apiRouter.get('/status', (req: Request, res: Response) => {
 // 2. QUERY MANAGEMENT
 // =================================================================
 
-apiRouter.get('/queries', (req: Request, res: Response) => {
-  const queries = store.getQueries();
+apiRouter.get('/queries', async (req: Request, res: Response) => {
+  const queries = await store.getQueries();
   res.json(queries);
 });
 
-apiRouter.post('/queries', (req: Request, res: Response) => {
+apiRouter.post('/queries', async (req: Request, res: Response) => {
   const { name, query_text, category, priority, run_frequency_minutes, initial_confidence } = req.body;
   if (!query_text) {
     return res.status(400).json({ error: 'query_text is required' });
@@ -177,7 +196,7 @@ apiRouter.post('/queries', (req: Request, res: Response) => {
 
   const id = `q_custom_${Date.now()}`;
   const now = new Date().toISOString();
-  const newQuery = store.saveQuery({
+  const newQuery = await store.saveQuery({
     id,
     name: name || query_text,
     query_text,
@@ -200,9 +219,9 @@ apiRouter.post('/queries', (req: Request, res: Response) => {
   res.json(newQuery);
 });
 
-apiRouter.patch('/queries/:id', (req: Request, res: Response) => {
+apiRouter.patch('/queries/:id', async (req: Request, res: Response) => {
   const { id } = req.params;
-  const updated = store.updateQuery(id, req.body);
+  const updated = await store.updateQuery(id, req.body);
   if (!updated) {
     return res.status(404).json({ error: 'Query not found' });
   }
@@ -219,9 +238,9 @@ apiRouter.post('/queries/:id/run', async (req: Request, res: Response) => {
   }
 });
 
-apiRouter.post('/queries/:id/reset', (req: Request, res: Response) => {
+apiRouter.post('/queries/:id/reset', async (req: Request, res: Response) => {
   const { id } = req.params;
-  const updated = store.updateQuery(id, {
+  const updated = await store.updateQuery(id, {
     posts_collected: 0,
     posts_passed_filter: 0,
     candidates_generated: 0,
@@ -230,58 +249,33 @@ apiRouter.post('/queries/:id/reset', (req: Request, res: Response) => {
     valuable_new_games: 0,
     precision: 0,
     last_since_id: undefined,
+    pending_next_token: undefined,
+    pagination_since_id: undefined,
+    pagination_newest_id: undefined,
+    pagination_started_at: undefined,
     last_status: 'IDLE',
     last_error: undefined
   });
   res.json(updated);
 });
 
+// P0-3: Run batch using global RunBudget shared across all queries
 apiRouter.post('/queries/run-batch', async (req: Request, res: Response) => {
   const { filter } = req.body;
-  const queries = store.getQueries();
-  const now = Date.now();
-
-  const toRun = queries.filter(q => {
-    if (!q.enabled) return false;
-    if (filter === 'P1') return q.priority === 'P1';
-    if (filter === 'DUE') {
-      if (!q.last_run_at) return true;
-      const elapsedMinutes = (now - new Date(q.last_run_at).getTime()) / (1000 * 60);
-      return elapsedMinutes >= (q.run_frequency_minutes || 120);
-    }
-    return true; // 'ENABLED' or undefined
-  });
-
-  const results: RunQueryResult[] = [];
-  for (const q of toRun) {
-    try {
-      const res = await runQuery(q.id);
-      results.push(res);
-    } catch (err: any) {
-      results.push({
-        query_id: q.id,
-        requests_used: 0,
-        posts_fetched: 0,
-        posts_passed: 0,
-        candidates_created: 0,
-        candidates_updated: 0,
-        gemini_calls_used: 0,
-        pagination_stopped_reason: 'ERROR',
-        cursor_advanced: false,
-        error: err.message
-      });
-    }
+  try {
+    const batchResult = await runBatchQueries(filter);
+    res.json(batchResult);
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
   }
-
-  res.json({ results });
 });
 
 // =================================================================
 // 3. RAW POSTS EXPLORER
 // =================================================================
 
-apiRouter.get('/posts', (req: Request, res: Response) => {
-  let posts = store.getPosts();
+apiRouter.get('/posts', async (req: Request, res: Response) => {
+  let posts = await store.getPosts();
 
   const { query_id, hard_filter_status, min_score, has_url, has_media, label, search } = req.query;
 
@@ -317,15 +311,15 @@ apiRouter.get('/posts', (req: Request, res: Response) => {
   res.json(posts);
 });
 
-apiRouter.get('/posts/:id', (req: Request, res: Response) => {
-  const post = store.getPost(req.params.id);
+apiRouter.get('/posts/:id', async (req: Request, res: Response) => {
+  const post = await store.getPost(req.params.id);
   if (!post) return res.status(404).json({ error: 'Post not found' });
   res.json(post);
 });
 
-apiRouter.patch('/posts/:id', (req: Request, res: Response) => {
+apiRouter.patch('/posts/:id', async (req: Request, res: Response) => {
   const { human_post_label } = req.body;
-  const updated = store.updatePost(req.params.id, {
+  const updated = await store.updatePost(req.params.id, {
     human_post_label: human_post_label as PostHumanLabel
   });
   if (!updated) return res.status(404).json({ error: 'Post not found' });
@@ -336,8 +330,8 @@ apiRouter.patch('/posts/:id', (req: Request, res: Response) => {
 // 4. GAME CANDIDATES & QUERY ATTRIBUTION
 // =================================================================
 
-apiRouter.get('/candidates', (req: Request, res: Response) => {
-  let candidates = store.getCandidates();
+apiRouter.get('/candidates', async (req: Request, res: Response) => {
+  let candidates = await store.getCandidates();
 
   const { status, browser_signal, reviewed_only, unreviewed_only, search, sort } = req.query;
 
@@ -375,19 +369,19 @@ apiRouter.get('/candidates', (req: Request, res: Response) => {
   res.json(candidates);
 });
 
-apiRouter.get('/candidates/:id', (req: Request, res: Response) => {
-  const candidate = store.getCandidate(req.params.id);
+apiRouter.get('/candidates/:id', async (req: Request, res: Response) => {
+  const candidate = await store.getCandidate(req.params.id);
   if (!candidate) return res.status(404).json({ error: 'Candidate not found' });
 
-  const posts = candidate.source_post_ids
-    .map(pid => store.getPost(pid))
-    .filter(Boolean);
+  const posts = (
+    await Promise.all(candidate.source_post_ids.map(pid => store.getPost(pid)))
+  ).filter(Boolean);
 
-  const queries = candidate.source_query_ids
-    .map(qid => store.getQuery(qid))
-    .filter(Boolean);
+  const queries = (
+    await Promise.all(candidate.source_query_ids.map(qid => store.getQuery(qid)))
+  ).filter(Boolean);
 
-  const evidence = store.getCandidateQueryEvidenceByCandidate(candidate.id);
+  const evidence = await store.getCandidateQueryEvidenceByCandidate(candidate.id);
 
   res.json({
     ...candidate,
@@ -397,14 +391,14 @@ apiRouter.get('/candidates/:id', (req: Request, res: Response) => {
   });
 });
 
-apiRouter.get('/candidates/:id/evidence', (req: Request, res: Response) => {
-  const evidence = store.getCandidateQueryEvidenceByCandidate(req.params.id);
+apiRouter.get('/candidates/:id/evidence', async (req: Request, res: Response) => {
+  const evidence = await store.getCandidateQueryEvidenceByCandidate(req.params.id);
   res.json(evidence);
 });
 
-apiRouter.patch('/candidates/:id', (req: Request, res: Response) => {
+apiRouter.patch('/candidates/:id', async (req: Request, res: Response) => {
   const { human_label, human_notes, canonical_name, aliases, status } = req.body;
-  const candidate = store.getCandidate(req.params.id);
+  const candidate = await store.getCandidate(req.params.id);
   if (!candidate) return res.status(404).json({ error: 'Candidate not found' });
 
   const now = new Date().toISOString();
@@ -439,13 +433,14 @@ apiRouter.patch('/candidates/:id', (req: Request, res: Response) => {
     partial.aliases = aliases;
   }
 
-  const updated = store.updateCandidate(candidate.id, partial);
+  const updated = await store.updateCandidate(candidate.id, partial);
 
   // Recalculate query precision stats for source queries
   for (const qid of candidate.source_query_ids) {
-    const q = store.getQuery(qid);
+    const q = await store.getQuery(qid);
     if (q) {
-      const associatedCands = store.getCandidates().filter(c => c.source_query_ids.includes(qid));
+      const allCands = await store.getCandidates();
+      const associatedCands = allCands.filter(c => c.source_query_ids.includes(qid));
       const validCount = associatedCands.filter(
         c => c.human_label === 'VALID_GAME' || c.human_label === 'VALUABLE_NEW_GAME'
       ).length;
@@ -461,7 +456,7 @@ apiRouter.patch('/candidates/:id', (req: Request, res: Response) => {
       const totalReviewed = validCount + rejectedCount;
       const prec = totalReviewed > 0 ? Math.round((validCount / totalReviewed) * 100) : 0;
 
-      store.updateQuery(qid, {
+      await store.updateQuery(qid, {
         human_validated_games: validCount,
         human_rejected: rejectedCount,
         valuable_new_games: valNew,
@@ -473,10 +468,10 @@ apiRouter.patch('/candidates/:id', (req: Request, res: Response) => {
   res.json(updated);
 });
 
-apiRouter.post('/candidates/:id/merge', (req: Request, res: Response) => {
-  const source = store.getCandidate(req.params.id);
+apiRouter.post('/candidates/:id/merge', async (req: Request, res: Response) => {
+  const source = await store.getCandidate(req.params.id);
   const { target_id } = req.body;
-  const target = store.getCandidate(target_id);
+  const target = await store.getCandidate(target_id);
 
   if (!source || !target) {
     return res.status(404).json({ error: 'Source or target candidate not found' });
@@ -486,10 +481,10 @@ apiRouter.post('/candidates/:id/merge', (req: Request, res: Response) => {
     if (!target.source_post_ids.includes(pid)) {
       target.source_post_ids.push(pid);
     }
-    const p = store.getPost(pid);
+    const p = await store.getPost(pid);
     if (p) {
       p.candidate_id = target.id;
-      store.savePost(p);
+      await store.savePost(p);
     }
   }
 
@@ -514,9 +509,9 @@ apiRouter.post('/candidates/:id/merge', (req: Request, res: Response) => {
     }
   }
 
-  const contributingPosts: XPost[] = target.source_post_ids
-    .map(pid => store.getPost(pid))
-    .filter((p): p is XPost => Boolean(p));
+  const contributingPosts: XPost[] = (
+    await Promise.all(target.source_post_ids.map(pid => store.getPost(pid)))
+  ).filter((p): p is XPost => Boolean(p));
 
   const hasBrowser = contributingPosts.some(
     (p: XPost) =>
@@ -542,10 +537,10 @@ apiRouter.post('/candidates/:id/merge', (req: Request, res: Response) => {
   target.unique_author_count = new Set(contributingPosts.map((p: XPost) => p.author_id)).size;
   target.max_engagement = Math.max(...contributingPosts.map((p: XPost) => p.like_count + p.repost_count), 0);
 
-  store.saveCandidate(target);
+  await store.saveCandidate(target);
 
   // Mark source candidate as DUPLICATE and merged
-  store.updateCandidate(source.id, {
+  await store.updateCandidate(source.id, {
     status: 'DUPLICATE',
     human_label: 'DUPLICATE',
     merged_into_candidate_id: target.id
@@ -555,13 +550,13 @@ apiRouter.post('/candidates/:id/merge', (req: Request, res: Response) => {
 });
 
 // =================================================================
-// 5. QUERY ANALYTICS & HONEST PRECISION REPORTING (P1 - 7 & 8)
+// 5. QUERY ANALYTICS & HONEST PRECISION REPORTING
 // =================================================================
 
-apiRouter.get('/analytics/queries', (req: Request, res: Response) => {
-  const queries = store.getQueries();
-  const allPosts = store.getPosts();
-  const allCandidates = store.getCandidates();
+apiRouter.get('/analytics/queries', async (req: Request, res: Response) => {
+  const queries = await store.getQueries();
+  const allPosts = await store.getPosts();
+  const allCandidates = await store.getCandidates();
 
   const summaries: QueryAnalyticsSummary[] = queries.map(q => {
     const qPosts = allPosts.filter(p => p.query_ids.includes(q.id));
@@ -697,8 +692,8 @@ apiRouter.get('/analytics/queries', (req: Request, res: Response) => {
 // 6. FEEDBACK ANALYTICS & SCORE CALIBRATION
 // =================================================================
 
-apiRouter.get('/analytics/feedback', (req: Request, res: Response) => {
-  const candidates = store.getCandidates();
+apiRouter.get('/analytics/feedback', async (req: Request, res: Response) => {
+  const candidates = await store.getCandidates();
   const reviewed = candidates.filter(
     c => c.human_label && c.human_label !== 'UNSURE' && c.human_label !== 'DUPLICATE'
   );
@@ -744,7 +739,7 @@ apiRouter.get('/analytics/feedback', (req: Request, res: Response) => {
   });
 
   const labelCounts: Record<string, number> = {};
-  for (const c of store.getCandidates()) {
+  for (const c of candidates) {
     if (c.human_label) {
       labelCounts[c.human_label] = (labelCounts[c.human_label] || 0) + 1;
     }
@@ -762,23 +757,31 @@ apiRouter.get('/analytics/feedback', (req: Request, res: Response) => {
 // 7. SETTINGS (P0 SECURITY - NO SECRETS RETURNED OR UPDATED)
 // =================================================================
 
-apiRouter.get('/settings', (req: Request, res: Response) => {
-  res.json(store.getSettings());
+apiRouter.get('/settings', async (req: Request, res: Response) => {
+  const settings = await store.getSettings();
+  res.json(settings);
 });
 
-apiRouter.patch('/settings', (req: Request, res: Response) => {
-  const updated = store.updateSettings(req.body);
+apiRouter.patch('/settings', async (req: Request, res: Response) => {
+  const updated = await store.updateSettings(req.body);
   res.json(updated);
 });
 
 // =================================================================
-// 8. RESET & SEED
+// 8. RESET & SEED (P0-4: STRICTLY DISABLED IN LIVE MODE)
 // =================================================================
 
 apiRouter.post('/reset-and-seed', async (req: Request, res: Response) => {
+  const settings = await store.getSettings();
+  if (settings.x_data_mode === 'live' || process.env.X_DATA_MODE === 'live') {
+    return res.status(403).json({
+      error: 'Action disabled in LIVE mode: reset-and-seed cannot be run in live mode to protect live data.'
+    });
+  }
+
   try {
-    store.resetAll();
-    const queries = store.getQueries();
+    await store.resetAll();
+    const queries = await store.getQueries();
     for (const q of queries) {
       await runQuery(q.id);
     }
@@ -789,14 +792,14 @@ apiRouter.post('/reset-and-seed', async (req: Request, res: Response) => {
 });
 
 // =================================================================
-// 9. CSV EXPORTS (PROTECTED BY AUTHGUARD)
+// 9. CSV EXPORTS (PROTECTED BY AUTHGUARD VIA HTTPONLY COOKIE)
 // =================================================================
 
-apiRouter.get('/export/:type', (req: Request, res: Response) => {
+apiRouter.get('/export/:type', async (req: Request, res: Response) => {
   const { type } = req.params;
 
   if (type === 'candidates') {
-    const candidates = store.getCandidates();
+    const candidates = await store.getCandidates();
     const headers = [
       'ID',
       'Canonical Name',
@@ -842,9 +845,9 @@ apiRouter.get('/export/:type', (req: Request, res: Response) => {
   }
 
   if (type === 'queries') {
-    const queries = store.getQueries();
-    const allPosts = store.getPosts();
-    const allCandidates = store.getCandidates();
+    const queries = await store.getQueries();
+    const allPosts = await store.getPosts();
+    const allCandidates = await store.getCandidates();
 
     const headers = [
       'ID',
@@ -893,12 +896,12 @@ apiRouter.get('/export/:type', (req: Request, res: Response) => {
 
     const csv = [headers.join(','), ...rows.map(r => r.join(','))].join('\n');
     res.setHeader('Content-Type', 'text/csv');
-    res.setHeader('Content-Disposition', 'attachment; filename="query_analytics.csv"');
+    res.setHeader('Content-Disposition', 'attachment; filename="query_performance.csv"');
     return res.send(csv);
   }
 
   if (type === 'posts') {
-    const posts = store.getPosts();
+    const posts = await store.getPosts();
     const headers = [
       'X Post ID',
       'Author',
@@ -941,35 +944,11 @@ apiRouter.get('/export/:type', (req: Request, res: Response) => {
 // =================================================================
 
 apiRouter.get('/jobs/run-due-queries', async (req: Request, res: Response) => {
-  const queries = store.getQueries();
-  const now = Date.now();
-  const dueQueries = queries.filter(q => {
-    if (!q.enabled) return false;
-    if (!q.last_run_at) return true;
-    const elapsedMinutes = (now - new Date(q.last_run_at).getTime()) / (1000 * 60);
-    return elapsedMinutes >= (q.run_frequency_minutes || 120);
+  const batchResult = await runBatchQueries('DUE');
+  res.json({
+    timestamp: new Date().toISOString(),
+    queries_executed: batchResult.results.length,
+    results: batchResult.results,
+    budget_usage: batchResult.budget_usage
   });
-
-  const results: RunQueryResult[] = [];
-  for (const q of dueQueries) {
-    try {
-      const res = await runQuery(q.id);
-      results.push(res);
-    } catch (err: any) {
-      results.push({
-        query_id: q.id,
-        requests_used: 0,
-        posts_fetched: 0,
-        posts_passed: 0,
-        candidates_created: 0,
-        candidates_updated: 0,
-        gemini_calls_used: 0,
-        pagination_stopped_reason: 'ERROR',
-        cursor_advanced: false,
-        error: err.message
-      });
-    }
-  }
-
-  res.json({ timestamp: new Date().toISOString(), queries_executed: results.length, results });
 });

@@ -3,8 +3,61 @@ import type { Request, Response, NextFunction } from 'express';
 
 const activeSessions = new Set<string>();
 
+// Basic login rate limiting: max 5 failed attempts per IP within 15 minutes
+interface FailedAttemptRecord {
+  count: number;
+  lockedUntil?: number;
+}
+const failedAttempts = new Map<string, FailedAttemptRecord>();
+const MAX_ATTEMPTS = 5;
+const LOCKOUT_MS = 15 * 60 * 1000; // 15 minutes
+
+export function getClientIp(req: Request): string {
+  const forwarded = req.headers['x-forwarded-for'];
+  if (typeof forwarded === 'string') {
+    return forwarded.split(',')[0].trim();
+  }
+  return req.ip || req.socket.remoteAddress || 'unknown';
+}
+
+export function checkRateLimit(ip: string): { allowed: boolean; remainingLockMs?: number } {
+  const record = failedAttempts.get(ip);
+  if (!record) return { allowed: true };
+
+  const now = Date.now();
+  if (record.lockedUntil && record.lockedUntil > now) {
+    return { allowed: false, remainingLockMs: record.lockedUntil - now };
+  }
+
+  // If lockout expired, reset
+  if (record.lockedUntil && record.lockedUntil <= now) {
+    failedAttempts.delete(ip);
+    return { allowed: true };
+  }
+
+  return { allowed: true };
+}
+
+export function recordFailedLogin(ip: string): void {
+  const record = failedAttempts.get(ip) || { count: 0 };
+  record.count++;
+  if (record.count >= MAX_ATTEMPTS) {
+    record.lockedUntil = Date.now() + LOCKOUT_MS;
+  }
+  failedAttempts.set(ip, record);
+}
+
+export function resetFailedLogin(ip: string): void {
+  failedAttempts.delete(ip);
+}
+
+/**
+ * P0-5 Auth Hardening:
+ * APP_PASSWORD must have NO fallback.
+ * Strictly empty string if undefined.
+ */
 export function getAppPassword(): string {
-  return process.env.APP_PASSWORD || 'discovery2026';
+  return process.env.APP_PASSWORD || '';
 }
 
 export function createSession(): string {
@@ -35,8 +88,15 @@ export function parseCookie(cookieHeader?: string): Record<string, string> {
   return cookies;
 }
 
+/**
+ * Authenticates request using ONLY:
+ * 1. HttpOnly Cookie: lab_session
+ * 2. Authorization header: Bearer <token> (for programmatic/automated testing)
+ *
+ * NOTE: auth_token query parameter support is STRICTLY REMOVED.
+ */
 export function authGuard(req: Request, res: Response, next: NextFunction): void {
-  // Allow login and status check endpoints
+  // Allow unauthenticated endpoints
   if (
     req.path === '/api/auth/login' ||
     req.path === '/api/auth/status' ||
@@ -45,7 +105,13 @@ export function authGuard(req: Request, res: Response, next: NextFunction): void
     return next();
   }
 
-  // 1. Check Authorization header
+  // 1. Check Cookie (Primary mechanism in production)
+  const cookies = parseCookie(req.headers.cookie);
+  if (cookies.lab_session && isValidSession(cookies.lab_session)) {
+    return next();
+  }
+
+  // 2. Check Authorization header (Permitted for test harnesses / server-to-server)
   const authHeader = req.headers.authorization;
   if (authHeader && authHeader.startsWith('Bearer ')) {
     const token = authHeader.substring(7).trim();
@@ -54,19 +120,7 @@ export function authGuard(req: Request, res: Response, next: NextFunction): void
     }
   }
 
-  // 2. Check Cookie
-  const cookies = parseCookie(req.headers.cookie);
-  if (cookies.lab_session && isValidSession(cookies.lab_session)) {
-    return next();
-  }
-
-  // 3. Check query param (specifically for browser download links like /api/export/*)
-  const queryToken = typeof req.query.auth_token === 'string' ? req.query.auth_token : undefined;
-  if (queryToken && isValidSession(queryToken)) {
-    return next();
-  }
-
-  // Unauthorized
+  // Unauthorized: fail closed
   res.status(401).json({
     error: 'Unauthorized: Private Lab authentication required',
     code: 'AUTH_REQUIRED'

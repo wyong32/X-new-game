@@ -1,5 +1,6 @@
 import fs from 'fs';
 import path from 'path';
+import type { Store } from './storeInterface.js';
 import type {
   XQuery,
   XPost,
@@ -8,6 +9,10 @@ import type {
   AppSettings
 } from '../../src/types.js';
 import { INITIAL_QUERIES } from '../fixtures/seedQueries.js';
+import { FirestoreStore } from './firestoreStore.js';
+
+export type { Store } from './storeInterface.js';
+export { FirestoreStore } from './firestoreStore.js';
 
 interface DatabaseSchema {
   queries: Record<string, XQuery>;
@@ -38,7 +43,7 @@ function getBaseDefaultSettings(): AppSettings {
   };
 }
 
-export class MemoryStore {
+export class MemoryStore implements Store {
   private data: DatabaseSchema;
   private saveTimeout: NodeJS.Timeout | null = null;
   private customDbFile?: string;
@@ -55,7 +60,7 @@ export class MemoryStore {
     this.loadFromDisk();
   }
 
-  public async init() {
+  public async init(): Promise<void> {
     return Promise.resolve();
   }
 
@@ -151,15 +156,15 @@ export class MemoryStore {
   }
 
   // --- QUERIES ---
-  public getQueries(): XQuery[] {
+  public async getQueries(): Promise<XQuery[]> {
     return Object.values(this.data.queries);
   }
 
-  public getQuery(id: string): XQuery | undefined {
+  public async getQuery(id: string): Promise<XQuery | undefined> {
     return this.data.queries[id];
   }
 
-  public saveQuery(query: XQuery): XQuery {
+  public async saveQuery(query: XQuery): Promise<XQuery> {
     const now = new Date().toISOString();
     query.updated_at = now;
     this.data.queries[query.id] = query;
@@ -167,7 +172,7 @@ export class MemoryStore {
     return query;
   }
 
-  public updateQuery(id: string, partial: Partial<XQuery>): XQuery | undefined {
+  public async updateQuery(id: string, partial: Partial<XQuery>): Promise<XQuery | undefined> {
     const existing = this.data.queries[id];
     if (!existing) return undefined;
     const updated: XQuery = {
@@ -181,25 +186,25 @@ export class MemoryStore {
   }
 
   // --- POSTS ---
-  public getPosts(): XPost[] {
+  public async getPosts(): Promise<XPost[]> {
     return Object.values(this.data.posts);
   }
 
-  public getPost(id: string): XPost | undefined {
+  public async getPost(id: string): Promise<XPost | undefined> {
     return this.data.posts[id];
   }
 
-  public getPostByXId(xPostId: string): XPost | undefined {
+  public async getPostByXId(xPostId: string): Promise<XPost | undefined> {
     return Object.values(this.data.posts).find(p => p.x_post_id === xPostId);
   }
 
-  public savePost(post: XPost): XPost {
+  public async savePost(post: XPost): Promise<XPost> {
     this.data.posts[post.id] = post;
     this.scheduleDiskSave();
     return post;
   }
 
-  public updatePost(id: string, partial: Partial<XPost>): XPost | undefined {
+  public async updatePost(id: string, partial: Partial<XPost>): Promise<XPost | undefined> {
     const existing = this.data.posts[id];
     if (!existing) return undefined;
     const updated: XPost = {
@@ -213,21 +218,21 @@ export class MemoryStore {
   }
 
   // --- CANDIDATES ---
-  public getCandidates(): GameCandidate[] {
+  public async getCandidates(): Promise<GameCandidate[]> {
     return Object.values(this.data.candidates);
   }
 
-  public getCandidate(id: string): GameCandidate | undefined {
+  public async getCandidate(id: string): Promise<GameCandidate | undefined> {
     return this.data.candidates[id];
   }
 
-  public saveCandidate(candidate: GameCandidate): GameCandidate {
+  public async saveCandidate(candidate: GameCandidate): Promise<GameCandidate> {
     this.data.candidates[candidate.id] = candidate;
     this.scheduleDiskSave();
     return candidate;
   }
 
-  public updateCandidate(id: string, partial: Partial<GameCandidate>): GameCandidate | undefined {
+  public async updateCandidate(id: string, partial: Partial<GameCandidate>): Promise<GameCandidate | undefined> {
     const existing = this.data.candidates[id];
     if (!existing) return undefined;
     const updated: GameCandidate = {
@@ -240,7 +245,7 @@ export class MemoryStore {
     return updated;
   }
 
-  public deleteCandidate(id: string): boolean {
+  public async deleteCandidate(id: string): Promise<boolean> {
     if (this.data.candidates[id]) {
       delete this.data.candidates[id];
       // Also delete evidence records for this candidate
@@ -256,15 +261,15 @@ export class MemoryStore {
   }
 
   // --- CANDIDATE QUERY EVIDENCE ---
-  public getCandidateQueryEvidenceList(): CandidateQueryEvidence[] {
+  public async getCandidateQueryEvidenceList(): Promise<CandidateQueryEvidence[]> {
     return Object.values(this.data.candidate_query_evidence);
   }
 
-  public getCandidateQueryEvidence(id: string): CandidateQueryEvidence | undefined {
+  public async getCandidateQueryEvidence(id: string): Promise<CandidateQueryEvidence | undefined> {
     return this.data.candidate_query_evidence[id];
   }
 
-  public saveCandidateQueryEvidence(evidence: CandidateQueryEvidence): CandidateQueryEvidence {
+  public async saveCandidateQueryEvidence(evidence: CandidateQueryEvidence): Promise<CandidateQueryEvidence> {
     const now = new Date().toISOString();
     evidence.updated_at = now;
     this.data.candidate_query_evidence[evidence.id] = evidence;
@@ -272,16 +277,16 @@ export class MemoryStore {
     return evidence;
   }
 
-  public getCandidateQueryEvidenceByCandidate(candidateId: string): CandidateQueryEvidence[] {
+  public async getCandidateQueryEvidenceByCandidate(candidateId: string): Promise<CandidateQueryEvidence[]> {
     return Object.values(this.data.candidate_query_evidence).filter(e => e.candidate_id === candidateId);
   }
 
-  public getCandidateQueryEvidenceByQuery(queryId: string): CandidateQueryEvidence[] {
+  public async getCandidateQueryEvidenceByQuery(queryId: string): Promise<CandidateQueryEvidence[]> {
     return Object.values(this.data.candidate_query_evidence).filter(e => e.query_id === queryId);
   }
 
   // --- SETTINGS ---
-  public getSettings(): AppSettings {
+  public async getSettings(): Promise<AppSettings> {
     const liveXConfigured = Boolean(process.env.X_BEARER_TOKEN && process.env.X_BEARER_TOKEN.trim().length > 0);
     const geminiConfigured = Boolean(
       process.env.GEMINI_API_KEY && process.env.GEMINI_API_KEY !== 'MY_GEMINI_API_KEY'
@@ -298,7 +303,7 @@ export class MemoryStore {
     return safeCopy;
   }
 
-  public updateSettings(partial: Partial<AppSettings>): AppSettings {
+  public async updateSettings(partial: Partial<AppSettings>): Promise<AppSettings> {
     // Strictly reject and strip any attempted secret injection through settings API
     const safePartial = { ...partial };
     if ('x_bearer_token' in (safePartial as any)) {
@@ -314,7 +319,7 @@ export class MemoryStore {
     return this.getSettings();
   }
 
-  public resetAll() {
+  public async resetAll(): Promise<void> {
     this.data.posts = {};
     this.data.candidates = {};
     this.data.queries = {};
@@ -324,4 +329,30 @@ export class MemoryStore {
   }
 }
 
-export const store = new MemoryStore();
+/**
+ * Store factory function:
+ * - Uses FirestoreStore in production when FIRESTORE_PROJECT_ID, GOOGLE_CLOUD_PROJECT,
+ *   or FIRESTORE_DATABASE_ID is configured or in production container.
+ * - Gracefully falls back to MemoryStore if Firestore credentials are not found (e.g. local dev / tests).
+ */
+export function createStore(): Store {
+  const shouldUseFirestore =
+    (Boolean(process.env.FIRESTORE_PROJECT_ID) ||
+      Boolean(process.env.GOOGLE_CLOUD_PROJECT) ||
+      process.env.NODE_ENV === 'production') &&
+    process.env.USE_MEMORY_STORE !== 'true';
+
+  if (shouldUseFirestore) {
+    try {
+      console.log('🔥 Initializing Cloud Firestore persistent storage...');
+      return new FirestoreStore();
+    } catch (err) {
+      console.warn('⚠️ Cloud Firestore initialization failed, falling back to MemoryStore:', err);
+      return new MemoryStore();
+    }
+  }
+
+  return new MemoryStore();
+}
+
+export const store: Store = createStore();

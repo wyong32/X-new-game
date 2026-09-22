@@ -47,14 +47,21 @@ export default function App() {
     }, 4000);
   };
 
-  // Authenticated fetch wrapper
-  const authFetch = useCallback(async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
-    const token = localStorage.getItem('lab_token');
-    const headers = new Headers(init?.headers);
-    if (token) {
-      headers.set('Authorization', `Bearer ${token}`);
+  // Clean up any legacy localStorage auth tokens
+  useEffect(() => {
+    try {
+      localStorage.removeItem('lab_token');
+    } catch {
+      // ignore
     }
-    const res = await fetch(input, { ...init, headers });
+  }, []);
+
+  // Authenticated fetch wrapper using HttpOnly cookies
+  const authFetch = useCallback(async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+    const res = await fetch(input, {
+      ...init,
+      credentials: 'same-origin'
+    });
     if (res.status === 401) {
       setIsAuthenticated(false);
     }

@@ -26,6 +26,11 @@ export interface XQuery {
   enabled: boolean;
   run_frequency_minutes: number;
   last_since_id?: string;
+  // Resumable pagination state
+  pending_next_token?: string;
+  pagination_since_id?: string;
+  pagination_newest_id?: string;
+  pagination_started_at?: string;
   last_run_at?: string;
   last_status?: 'SUCCESS' | 'ERROR' | 'IDLE';
   last_error?: string;
@@ -203,3 +208,23 @@ export interface QueryAnalyticsSummary {
   posts_per_valuable_game: number;
   yield_valuable_per_1k_posts: number;
 }
+
+export interface RunBudget {
+  requestsRemaining: number;
+  postsRemaining: number;
+  geminiRemaining: number;
+  initialRequests: number;
+  initialPosts: number;
+  initialGemini: number;
+}
+
+export interface RunBudgetUsage {
+  requests_used: number;
+  requests_remaining: number;
+  posts_fetched: number;
+  posts_remaining: number;
+  gemini_calls_used: number;
+  gemini_remaining: number;
+  stopped_early_reason?: string;
+}
+

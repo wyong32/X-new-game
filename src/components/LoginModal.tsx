@@ -2,7 +2,7 @@ import React, { useState } from 'react';
 import { Lock, ArrowRight, ShieldCheck, AlertCircle } from 'lucide-react';
 
 interface LoginModalProps {
-  onLoginSuccess: (token: string) => void;
+  onLoginSuccess: () => void;
 }
 
 export const LoginModal: React.FC<LoginModalProps> = ({ onLoginSuccess }) => {
@@ -29,8 +29,7 @@ export const LoginModal: React.FC<LoginModalProps> = ({ onLoginSuccess }) => {
         throw new Error(data.error || 'Authentication failed. Please verify password.');
       }
 
-      localStorage.setItem('lab_token', data.token);
-      onLoginSuccess(data.token);
+      onLoginSuccess();
     } catch (err: any) {
       setError(err.message || 'Authentication error');
     } finally {
@@ -74,7 +73,7 @@ export const LoginModal: React.FC<LoginModalProps> = ({ onLoginSuccess }) => {
               className="w-full bg-slate-950 border border-slate-700 text-white text-sm rounded-lg px-3.5 py-2.5 focus:outline-none focus:border-sky-500 font-mono transition-colors"
             />
             <p className="text-[11px] text-slate-500">
-              Default password configured in <code className="text-slate-400">APP_PASSWORD</code> (e.g. <span className="text-sky-400 font-mono">discovery2026</span>)
+              Authentication password configured in server environment variable <code className="text-slate-400 font-mono">APP_PASSWORD</code>.
             </p>
           </div>
 
@@ -93,7 +92,7 @@ export const LoginModal: React.FC<LoginModalProps> = ({ onLoginSuccess }) => {
             <ShieldCheck className="w-3.5 h-3.5 text-emerald-400" />
             <span>Protected Endpoint Guard</span>
           </span>
-          <span className="font-mono">Security Level: P0</span>
+          <span className="font-mono text-slate-400">Security: HttpOnly Cookie</span>
         </div>
       </div>
     </div>
