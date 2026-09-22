@@ -1,0 +1,6 @@
+{
+  "name": "X Game Discovery Lab",
+  "description": "Research platform evaluating X queries, post filtering, game name extraction, candidate scoring, and query precision analytics for indie & browser games.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
