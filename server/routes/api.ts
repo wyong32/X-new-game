@@ -1,23 +1,101 @@
 import { Router, Request, Response } from 'express';
 import { store } from '../db/store.js';
-import { runQuery, runBatchQueries, seedAndRunMockWorkflow } from '../services/queryRunner.js';
+import { runQuery, type RunQueryResult } from '../services/queryRunner.js';
 import {
   computeCandidateScore,
   determineCandidateStatus
 } from '../services/candidateService.js';
 import { normalizeGameName, cleanCanonicalTitle } from '../services/normalization.js';
+import {
+  authGuard,
+  getAppPassword,
+  createSession,
+  invalidateSession,
+  isValidSession,
+  parseCookie
+} from '../services/auth.js';
 import type {
+  XPost,
   CandidateHumanLabel,
   PostHumanLabel,
   QueryCategory,
   QueryPriority,
   QueryHealth,
-  QueryAnalyticsSummary
+  QueryAnalyticsSummary,
+  CandidateQueryEvidence
 } from '../../src/types.js';
 
 export const apiRouter = Router();
 
-// 1. App Status & Overview
+// =================================================================
+// 0. AUTHENTICATION (P0 SECURITY GUARD)
+// =================================================================
+
+apiRouter.post('/auth/login', (req: Request, res: Response) => {
+  const { password } = req.body;
+  const expected = getAppPassword();
+
+  if (!password || password !== expected) {
+    return res.status(401).json({ success: false, error: 'Invalid lab password' });
+  }
+
+  const token = createSession();
+  res.cookie('lab_session', token, {
+    httpOnly: true,
+    sameSite: 'lax',
+    maxAge: 7 * 24 * 60 * 60 * 1000 // 7 days
+  });
+
+  res.json({
+    success: true,
+    token,
+    message: 'Authenticated successfully'
+  });
+});
+
+apiRouter.post('/auth/logout', (req: Request, res: Response) => {
+  const cookies = parseCookie(req.headers.cookie);
+  if (cookies.lab_session) {
+    invalidateSession(cookies.lab_session);
+  }
+  const authHeader = req.headers.authorization;
+  if (authHeader && authHeader.startsWith('Bearer ')) {
+    invalidateSession(authHeader.substring(7).trim());
+  }
+
+  res.clearCookie('lab_session');
+  res.json({ success: true, message: 'Logged out successfully' });
+});
+
+apiRouter.get('/auth/status', (req: Request, res: Response) => {
+  let authenticated = false;
+
+  const authHeader = req.headers.authorization;
+  if (authHeader && authHeader.startsWith('Bearer ')) {
+    authenticated = isValidSession(authHeader.substring(7).trim());
+  }
+
+  if (!authenticated) {
+    const cookies = parseCookie(req.headers.cookie);
+    if (cookies.lab_session) {
+      authenticated = isValidSession(cookies.lab_session);
+    }
+  }
+
+  if (!authenticated && typeof req.query.auth_token === 'string') {
+    authenticated = isValidSession(req.query.auth_token);
+  }
+
+  res.json({ authenticated });
+});
+
+// Protect all subsequent API endpoints
+apiRouter.use(authGuard);
+
+// =================================================================
+// 1. APP STATUS & OVERVIEW
+// =================================================================
+
 apiRouter.get('/status', (req: Request, res: Response) => {
   const settings = store.getSettings();
   const queries = store.getQueries();
@@ -26,22 +104,32 @@ apiRouter.get('/status', (req: Request, res: Response) => {
 
   const passedPosts = posts.filter(p => p.hard_filter_status === 'PASSED');
   const highConf = candidates.filter(c => c.candidate_score >= 80);
-  const reviewed = candidates.filter(c => Boolean(c.human_label));
+
+  // Standardized review counts (excluding UNSURE and DUPLICATE)
   const valuableNew = candidates.filter(c => c.human_label === 'VALUABLE_NEW_GAME');
   const validGames = candidates.filter(
     c => c.human_label === 'VALID_GAME' || c.human_label === 'VALUABLE_NEW_GAME'
   );
+  const rejected = candidates.filter(
+    c =>
+      c.human_label === 'NOT_A_GAME' ||
+      c.human_label === 'OLD_GAME' ||
+      c.human_label === 'NOISE' ||
+      c.human_label === 'WRONG_GAME_NAME' ||
+      c.human_label === 'GAME_NOT_TARGET'
+  );
+  const standardReviewed = validGames.length + rejected.length;
 
   const noiseRate = posts.length > 0
     ? Math.round(((posts.length - passedPosts.length) / posts.length) * 100)
     : 0;
 
-  const valuableNewPrecision = reviewed.length > 0
-    ? Math.round((valuableNew.length / reviewed.length) * 100)
+  const valuableNewPrecision = standardReviewed > 0
+    ? Math.round((valuableNew.length / standardReviewed) * 100)
     : 0;
 
-  const candidatePrecision = reviewed.length > 0
-    ? Math.round((validGames.length / reviewed.length) * 100)
+  const candidatePrecision = standardReviewed > 0
+    ? Math.round((validGames.length / standardReviewed) * 100)
     : 0;
 
   const usefulYieldPer1k = posts.length > 0
@@ -50,14 +138,18 @@ apiRouter.get('/status', (req: Request, res: Response) => {
 
   res.json({
     mode: settings.x_data_mode,
+    x_api_configured: settings.x_api_configured,
     gemini_ready: settings.gemini_api_key_configured,
+    gemini_extraction_enabled: settings.gemini_extraction_enabled,
     total_queries: queries.length,
     enabled_queries: queries.filter(q => q.enabled).length,
     total_posts: posts.length,
     passed_posts: passedPosts.length,
     total_candidates: candidates.length,
     high_confidence_candidates: highConf.length,
-    reviewed_candidates: reviewed.length,
+    reviewed_candidates: standardReviewed,
+    unsure_candidates: candidates.filter(c => c.human_label === 'UNSURE').length,
+    duplicate_candidates: candidates.filter(c => c.human_label === 'DUPLICATE').length,
     valuable_new_games: valuableNew.length,
     valid_games: validGames.length,
     noise_rate_pct: noiseRate,
@@ -68,7 +160,10 @@ apiRouter.get('/status', (req: Request, res: Response) => {
   });
 });
 
-// 2. Query Management
+// =================================================================
+// 2. QUERY MANAGEMENT
+// =================================================================
+
 apiRouter.get('/queries', (req: Request, res: Response) => {
   const queries = store.getQueries();
   res.json(queries);
@@ -142,16 +237,49 @@ apiRouter.post('/queries/:id/reset', (req: Request, res: Response) => {
 });
 
 apiRouter.post('/queries/run-batch', async (req: Request, res: Response) => {
-  const { filter } = req.body; // 'P1' | 'ENABLED' | 'DUE'
-  try {
-    const results = await runBatchQueries(filter);
-    res.json({ results });
-  } catch (err: any) {
-    res.status(500).json({ error: err.message });
+  const { filter } = req.body;
+  const queries = store.getQueries();
+  const now = Date.now();
+
+  const toRun = queries.filter(q => {
+    if (!q.enabled) return false;
+    if (filter === 'P1') return q.priority === 'P1';
+    if (filter === 'DUE') {
+      if (!q.last_run_at) return true;
+      const elapsedMinutes = (now - new Date(q.last_run_at).getTime()) / (1000 * 60);
+      return elapsedMinutes >= (q.run_frequency_minutes || 120);
+    }
+    return true; // 'ENABLED' or undefined
+  });
+
+  const results: RunQueryResult[] = [];
+  for (const q of toRun) {
+    try {
+      const res = await runQuery(q.id);
+      results.push(res);
+    } catch (err: any) {
+      results.push({
+        query_id: q.id,
+        requests_used: 0,
+        posts_fetched: 0,
+        posts_passed: 0,
+        candidates_created: 0,
+        candidates_updated: 0,
+        gemini_calls_used: 0,
+        pagination_stopped_reason: 'ERROR',
+        cursor_advanced: false,
+        error: err.message
+      });
+    }
   }
+
+  res.json({ results });
 });
 
-// 3. Raw Posts Explorer
+// =================================================================
+// 3. RAW POSTS EXPLORER
+// =================================================================
+
 apiRouter.get('/posts', (req: Request, res: Response) => {
   let posts = store.getPosts();
 
@@ -185,9 +313,7 @@ apiRouter.get('/posts', (req: Request, res: Response) => {
     );
   }
 
-  // Sort newest first
   posts.sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime());
-
   res.json(posts);
 });
 
@@ -206,7 +332,10 @@ apiRouter.patch('/posts/:id', (req: Request, res: Response) => {
   res.json(updated);
 });
 
-// 4. Game Candidates
+// =================================================================
+// 4. GAME CANDIDATES & QUERY ATTRIBUTION
+// =================================================================
+
 apiRouter.get('/candidates', (req: Request, res: Response) => {
   let candidates = store.getCandidates();
 
@@ -233,7 +362,6 @@ apiRouter.get('/candidates', (req: Request, res: Response) => {
     );
   }
 
-  // Sorting
   if (sort === 'score_desc' || !sort) {
     candidates.sort((a, b) => b.candidate_score - a.candidate_score);
   } else if (sort === 'newest') {
@@ -251,21 +379,27 @@ apiRouter.get('/candidates/:id', (req: Request, res: Response) => {
   const candidate = store.getCandidate(req.params.id);
   if (!candidate) return res.status(404).json({ error: 'Candidate not found' });
 
-  // Expand source posts
   const posts = candidate.source_post_ids
     .map(pid => store.getPost(pid))
     .filter(Boolean);
 
-  // Expand source queries
   const queries = candidate.source_query_ids
     .map(qid => store.getQuery(qid))
     .filter(Boolean);
 
+  const evidence = store.getCandidateQueryEvidenceByCandidate(candidate.id);
+
   res.json({
     ...candidate,
     posts,
-    queries
+    queries,
+    evidence
   });
+});
+
+apiRouter.get('/candidates/:id/evidence', (req: Request, res: Response) => {
+  const evidence = store.getCandidateQueryEvidenceByCandidate(req.params.id);
+  res.json(evidence);
 });
 
 apiRouter.patch('/candidates/:id', (req: Request, res: Response) => {
@@ -307,7 +441,7 @@ apiRouter.patch('/candidates/:id', (req: Request, res: Response) => {
 
   const updated = store.updateCandidate(candidate.id, partial);
 
-  // Trigger recalculation of query precision stats for source queries
+  // Recalculate query precision stats for source queries
   for (const qid of candidate.source_query_ids) {
     const q = store.getQuery(qid);
     if (q) {
@@ -324,8 +458,8 @@ apiRouter.patch('/candidates/:id', (req: Request, res: Response) => {
           c.human_label === 'GAME_NOT_TARGET'
       ).length;
       const valNew = associatedCands.filter(c => c.human_label === 'VALUABLE_NEW_GAME').length;
-      const totalRev = validCount + rejectedCount;
-      const prec = totalRev > 0 ? Math.round((validCount / totalRev) * 100) : 0;
+      const totalReviewed = validCount + rejectedCount;
+      const prec = totalReviewed > 0 ? Math.round((validCount / totalReviewed) * 100) : 0;
 
       store.updateQuery(qid, {
         human_validated_games: validCount,
@@ -339,7 +473,6 @@ apiRouter.patch('/candidates/:id', (req: Request, res: Response) => {
   res.json(updated);
 });
 
-// Merge candidate A into candidate B
 apiRouter.post('/candidates/:id/merge', (req: Request, res: Response) => {
   const source = store.getCandidate(req.params.id);
   const { target_id } = req.body;
@@ -349,12 +482,10 @@ apiRouter.post('/candidates/:id/merge', (req: Request, res: Response) => {
     return res.status(404).json({ error: 'Source or target candidate not found' });
   }
 
-  // Combine source post IDs & query IDs
   for (const pid of source.source_post_ids) {
     if (!target.source_post_ids.includes(pid)) {
       target.source_post_ids.push(pid);
     }
-    // Update post pointer
     const p = store.getPost(pid);
     if (p) {
       p.candidate_id = target.id;
@@ -374,7 +505,7 @@ apiRouter.post('/candidates/:id/merge', (req: Request, res: Response) => {
     }
   }
 
-  if (!target.aliases.includes(source.canonical_name)) {
+  if (source.canonical_name !== target.canonical_name && !target.aliases.includes(source.canonical_name)) {
     target.aliases.push(source.canonical_name);
   }
   for (const a of source.aliases) {
@@ -383,12 +514,16 @@ apiRouter.post('/candidates/:id/merge', (req: Request, res: Response) => {
     }
   }
 
-  // Recalculate target score
-  const contributingPosts = target.source_post_ids
+  const contributingPosts: XPost[] = target.source_post_ids
     .map(pid => store.getPost(pid))
-    .filter((p): p is any => Boolean(p));
+    .filter((p): p is XPost => Boolean(p));
 
-  const hasBrowser = target.browser_signal || source.browser_signal;
+  const hasBrowser = contributingPosts.some(
+    (p: XPost) =>
+      p.game_context_positive_reasons.some((r: string) => r.includes('Browser/web')) ||
+      p.urls.some((u: string) => /(?:poki|crazygames|html5|webgl)/i.test(u))
+  );
+
   const scored = computeCandidateScore({
     canonical_name: target.canonical_name,
     normalized_name: target.normalized_name,
@@ -404,8 +539,8 @@ apiRouter.post('/candidates/:id/merge', (req: Request, res: Response) => {
   target.score_breakdown = scored.score_breakdown;
   target.why_selected = scored.why_selected;
   target.unique_post_count = contributingPosts.length;
-  target.unique_author_count = new Set(contributingPosts.map(p => p.author_id)).size;
-  target.max_engagement = Math.max(...contributingPosts.map(p => p.like_count + p.repost_count), 0);
+  target.unique_author_count = new Set(contributingPosts.map((p: XPost) => p.author_id)).size;
+  target.max_engagement = Math.max(...contributingPosts.map((p: XPost) => p.like_count + p.repost_count), 0);
 
   store.saveCandidate(target);
 
@@ -419,7 +554,10 @@ apiRouter.post('/candidates/:id/merge', (req: Request, res: Response) => {
   res.json({ target, source });
 });
 
-// 5. Query Analytics
+// =================================================================
+// 5. QUERY ANALYTICS & HONEST PRECISION REPORTING (P1 - 7 & 8)
+// =================================================================
+
 apiRouter.get('/analytics/queries', (req: Request, res: Response) => {
   const queries = store.getQueries();
   const allPosts = store.getPosts();
@@ -430,7 +568,13 @@ apiRouter.get('/analytics/queries', (req: Request, res: Response) => {
     const passed = qPosts.filter(p => p.hard_filter_status === 'PASSED');
     const qCandidates = allCandidates.filter(c => c.source_query_ids.includes(q.id));
 
-    const humanReviewed = qCandidates.filter(c => Boolean(c.human_label));
+    // Attribution: First Discovery counts
+    const firstDiscoveryCandidates = allCandidates.filter(c => c.first_discovery_query_id === q.id);
+    const firstDiscoveryValuable = firstDiscoveryCandidates.filter(
+      c => c.human_label === 'VALUABLE_NEW_GAME'
+    );
+
+    // Standardized reviews:
     const validGames = qCandidates.filter(
       c => c.human_label === 'VALID_GAME' || c.human_label === 'VALUABLE_NEW_GAME'
     );
@@ -444,12 +588,22 @@ apiRouter.get('/analytics/queries', (req: Request, res: Response) => {
         c.human_label === 'GAME_NOT_TARGET'
     );
 
+    // Explicit non-evaluated or unsure counts
+    const unsureCount = qCandidates.filter(c => c.human_label === 'UNSURE').length;
+    const duplicateCount = qCandidates.filter(c => c.human_label === 'DUPLICATE').length;
+    const unreviewedCount = qCandidates.filter(c => !c.human_label).length;
+
+    // Standardized review denominator = valid + rejected (excludes UNSURE, DUPLICATE, UNREVIEWED)
+    const standardReviewedCount = validGames.length + rejected.length;
+
     const passRate = qPosts.length > 0 ? Number(((passed.length / qPosts.length) * 100).toFixed(1)) : 0;
-    const precisionValid = humanReviewed.length > 0
-      ? Number(((validGames.length / humanReviewed.length) * 100).toFixed(1))
+
+    const precisionValid = standardReviewedCount > 0
+      ? Number(((validGames.length / standardReviewedCount) * 100).toFixed(1))
       : 0;
-    const precisionValuable = humanReviewed.length > 0
-      ? Number(((valuableNew.length / humanReviewed.length) * 100).toFixed(1))
+
+    const precisionValuable = standardReviewedCount > 0
+      ? Number(((valuableNew.length / standardReviewedCount) * 100).toFixed(1))
       : 0;
 
     const postsPerValid = validGames.length > 0
@@ -463,11 +617,16 @@ apiRouter.get('/analytics/queries', (req: Request, res: Response) => {
       ? Number(((valuableNew.length / qPosts.length) * 1000).toFixed(1))
       : 0;
 
-    // Determine Query Health
+    // First Discovery Valuable Yield / 1000 Posts = (first_discovery_valuable_games / posts_collected) * 1000
+    const firstDiscoveryYieldPer1k = qPosts.length > 0
+      ? Number(((firstDiscoveryValuable.length / qPosts.length) * 1000).toFixed(1))
+      : 0;
+
+    // Health calculation
     let health: QueryHealth = 'INSUFFICIENT_DATA';
     if (q.last_status === 'ERROR') {
       health = 'ERROR';
-    } else if (humanReviewed.length < 2 && qPosts.length < 5) {
+    } else if (standardReviewedCount < 2 && qPosts.length < 5) {
       health = 'INSUFFICIENT_DATA';
     } else if (precisionValuable >= 40 && passRate >= 60) {
       health = 'EXCELLENT';
@@ -490,26 +649,36 @@ apiRouter.get('/analytics/queries', (req: Request, res: Response) => {
       posts_passed: passed.length,
       pass_rate: passRate,
       candidates_generated: qCandidates.length,
-      human_reviewed_candidates: humanReviewed.length,
+      first_discovery_candidates_count: firstDiscoveryCandidates.length,
+      first_discovery_valuable_games: firstDiscoveryValuable.length,
+      human_reviewed_candidates: standardReviewedCount,
       human_valid_games: validGames.length,
       valuable_new_games: valuableNew.length,
       rejected_candidates: rejected.length,
+      unsure_candidates: unsureCount,
+      duplicate_candidates: duplicateCount,
+      unreviewed_candidates: unreviewedCount,
       precision_valid_game: precisionValid,
+      validation_precision: precisionValid,
       precision_valuable_new_game: precisionValuable,
+      first_discovery_valuable_yield_per_1k_posts: firstDiscoveryYieldPer1k,
       posts_per_valid_game: postsPerValid,
       posts_per_valuable_game: postsPerValuable,
       yield_valuable_per_1k_posts: yieldPer1k
     };
   });
 
-  // Query Leaderboards
   const bestByValuableYield = [...summaries]
     .filter(s => s.total_posts > 0)
     .sort((a, b) => b.yield_valuable_per_1k_posts - a.yield_valuable_per_1k_posts);
 
+  const bestByFirstDiscoveryYield = [...summaries]
+    .filter(s => s.total_posts > 0)
+    .sort((a, b) => b.first_discovery_valuable_yield_per_1k_posts - a.first_discovery_valuable_yield_per_1k_posts);
+
   const bestByPrecision = [...summaries]
     .filter(s => s.human_reviewed_candidates > 0)
-    .sort((a, b) => b.precision_valid_game - a.precision_valid_game);
+    .sort((a, b) => b.validation_precision - a.validation_precision);
 
   const highestNoiseQueries = [...summaries]
     .filter(s => s.total_posts > 0)
@@ -518,17 +687,22 @@ apiRouter.get('/analytics/queries', (req: Request, res: Response) => {
   res.json({
     summaries,
     leaderboard_valuable_yield: bestByValuableYield.slice(0, 5),
+    leaderboard_first_discovery_yield: bestByFirstDiscoveryYield.slice(0, 5),
     leaderboard_precision: bestByPrecision.slice(0, 5),
     highest_noise: highestNoiseQueries.slice(0, 5)
   });
 });
 
-// 6. Feedback Analytics & Score Calibration
+// =================================================================
+// 6. FEEDBACK ANALYTICS & SCORE CALIBRATION
+// =================================================================
+
 apiRouter.get('/analytics/feedback', (req: Request, res: Response) => {
   const candidates = store.getCandidates();
-  const reviewed = candidates.filter(c => Boolean(c.human_label));
+  const reviewed = candidates.filter(
+    c => c.human_label && c.human_label !== 'UNSURE' && c.human_label !== 'DUPLICATE'
+  );
 
-  // Score calibration buckets (Section 50)
   const buckets = [
     { label: '90–100', min: 90, max: 100 },
     { label: '80–89', min: 80, max: 89 },
@@ -555,8 +729,7 @@ apiRouter.get('/analytics/feedback', (req: Request, res: Response) => {
     };
   });
 
-  // Extraction Method precision (Section 51)
-  const methods = ['URL_METADATA', 'EXPLICIT_PATTERN', 'HASHTAG', 'HEURISTIC', 'GEMINI', 'MANUAL'];
+  const methods = ['URL_SLUG', 'URL_METADATA', 'EXPLICIT_PATTERN', 'HASHTAG', 'HEURISTIC', 'GEMINI', 'MANUAL'];
   const extractionStats = methods.map(m => {
     const byMethod = reviewed.filter(c => c.extraction_method === m);
     const valid = byMethod.filter(
@@ -570,9 +743,8 @@ apiRouter.get('/analytics/feedback', (req: Request, res: Response) => {
     };
   });
 
-  // Label breakdown
   const labelCounts: Record<string, number> = {};
-  for (const c of reviewed) {
+  for (const c of store.getCandidates()) {
     if (c.human_label) {
       labelCounts[c.human_label] = (labelCounts[c.human_label] || 0) + 1;
     }
@@ -586,7 +758,10 @@ apiRouter.get('/analytics/feedback', (req: Request, res: Response) => {
   });
 });
 
-// 7. Settings
+// =================================================================
+// 7. SETTINGS (P0 SECURITY - NO SECRETS RETURNED OR UPDATED)
+// =================================================================
+
 apiRouter.get('/settings', (req: Request, res: Response) => {
   res.json(store.getSettings());
 });
@@ -596,18 +771,27 @@ apiRouter.patch('/settings', (req: Request, res: Response) => {
   res.json(updated);
 });
 
-// 8. Re-seed Mock Data workflow
+// =================================================================
+// 8. RESET & SEED
+// =================================================================
+
 apiRouter.post('/reset-and-seed', async (req: Request, res: Response) => {
   try {
     store.resetAll();
-    await seedAndRunMockWorkflow();
+    const queries = store.getQueries();
+    for (const q of queries) {
+      await runQuery(q.id);
+    }
     res.json({ success: true, message: 'Database reset and mock pipeline completed.' });
   } catch (err: any) {
     res.status(500).json({ error: err.message });
   }
 });
 
-// 9. CSV Export (Section 52)
+// =================================================================
+// 9. CSV EXPORTS (PROTECTED BY AUTHGUARD)
+// =================================================================
+
 apiRouter.get('/export/:type', (req: Request, res: Response) => {
   const { type } = req.params;
 
@@ -617,6 +801,7 @@ apiRouter.get('/export/:type', (req: Request, res: Response) => {
       'ID',
       'Canonical Name',
       'Normalized Name',
+      'First Discovery Query ID',
       'Score',
       'Entity Confidence',
       'Browser Signal',
@@ -635,6 +820,7 @@ apiRouter.get('/export/:type', (req: Request, res: Response) => {
       c.id,
       `"${c.canonical_name.replace(/"/g, '""')}"`,
       `"${c.normalized_name.replace(/"/g, '""')}"`,
+      c.first_discovery_query_id || '',
       c.candidate_score,
       c.entity_confidence,
       c.browser_signal ? 'YES' : 'NO',
@@ -657,6 +843,9 @@ apiRouter.get('/export/:type', (req: Request, res: Response) => {
 
   if (type === 'queries') {
     const queries = store.getQueries();
+    const allPosts = store.getPosts();
+    const allCandidates = store.getCandidates();
+
     const headers = [
       'ID',
       'Name',
@@ -667,27 +856,40 @@ apiRouter.get('/export/:type', (req: Request, res: Response) => {
       'Posts Collected',
       'Passed Filter',
       'Candidates Generated',
+      'First Discovery Candidates',
+      'First Discovery Valuable Games',
       'Human Valid Games',
       'Valuable New Games',
       'Human Rejected',
-      'Precision'
+      'Validation Precision',
+      'First Discovery Valuable Yield / 1k Posts'
     ];
 
-    const rows = queries.map(q => [
-      q.id,
-      `"${q.name.replace(/"/g, '""')}"`,
-      `"${q.query_text.replace(/"/g, '""')}"`,
-      q.category,
-      q.priority,
-      q.enabled ? 'TRUE' : 'FALSE',
-      q.posts_collected,
-      q.posts_passed_filter,
-      q.candidates_generated,
-      q.human_validated_games,
-      q.valuable_new_games,
-      q.human_rejected,
-      `${q.precision}%`
-    ]);
+    const rows = queries.map(q => {
+      const qPosts = allPosts.filter(p => p.query_ids.includes(q.id));
+      const firstDisc = allCandidates.filter(c => c.first_discovery_query_id === q.id);
+      const firstDiscVal = firstDisc.filter(c => c.human_label === 'VALUABLE_NEW_GAME');
+      const yield1k = qPosts.length > 0 ? ((firstDiscVal.length / qPosts.length) * 1000).toFixed(1) : '0.0';
+
+      return [
+        q.id,
+        `"${q.name.replace(/"/g, '""')}"`,
+        `"${q.query_text.replace(/"/g, '""')}"`,
+        q.category,
+        q.priority,
+        q.enabled ? 'TRUE' : 'FALSE',
+        q.posts_collected,
+        q.posts_passed_filter,
+        q.candidates_generated,
+        firstDisc.length,
+        firstDiscVal.length,
+        q.human_validated_games,
+        q.valuable_new_games,
+        q.human_rejected,
+        `${q.precision}%`,
+        yield1k
+      ];
+    });
 
     const csv = [headers.join(','), ...rows.map(r => r.join(','))].join('\n');
     res.setHeader('Content-Type', 'text/csv');
@@ -734,12 +936,40 @@ apiRouter.get('/export/:type', (req: Request, res: Response) => {
   res.status(400).json({ error: 'Invalid export type. Supported: candidates, queries, posts' });
 });
 
-// 10. Scheduled due queries endpoint (Section 45)
+// =================================================================
+// 10. SCHEDULED DUE QUERIES
+// =================================================================
+
 apiRouter.get('/jobs/run-due-queries', async (req: Request, res: Response) => {
-  try {
-    const results = await runBatchQueries('DUE');
-    res.json({ timestamp: new Date().toISOString(), queries_executed: results.length, results });
-  } catch (err: any) {
-    res.status(500).json({ error: err.message });
+  const queries = store.getQueries();
+  const now = Date.now();
+  const dueQueries = queries.filter(q => {
+    if (!q.enabled) return false;
+    if (!q.last_run_at) return true;
+    const elapsedMinutes = (now - new Date(q.last_run_at).getTime()) / (1000 * 60);
+    return elapsedMinutes >= (q.run_frequency_minutes || 120);
+  });
+
+  const results: RunQueryResult[] = [];
+  for (const q of dueQueries) {
+    try {
+      const res = await runQuery(q.id);
+      results.push(res);
+    } catch (err: any) {
+      results.push({
+        query_id: q.id,
+        requests_used: 0,
+        posts_fetched: 0,
+        posts_passed: 0,
+        candidates_created: 0,
+        candidates_updated: 0,
+        gemini_calls_used: 0,
+        pagination_stopped_reason: 'ERROR',
+        cursor_advanced: false,
+        error: err.message
+      });
+    }
   }
+
+  res.json({ timestamp: new Date().toISOString(), queries_executed: results.length, results });
 });

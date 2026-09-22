@@ -32,7 +32,10 @@ export const FeedbackAnalytics: React.FC = () => {
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
-    fetch('/api/analytics/feedback')
+    const token = localStorage.getItem('lab_token');
+    fetch('/api/analytics/feedback', {
+      headers: token ? { Authorization: `Bearer ${token}` } : {}
+    })
       .then(res => res.json())
       .then(json => setData(json))
       .catch(err => console.error(err))

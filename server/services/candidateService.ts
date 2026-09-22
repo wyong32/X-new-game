@@ -29,14 +29,14 @@ export function computeCandidateScore(candidate: {
 
   // 1. Entity confidence (max 30)
   let entityConfidencePoints = 0;
-  if (candidate.extraction_method === 'URL_METADATA') {
+  if (candidate.extraction_method === 'URL_SLUG' || candidate.extraction_method === 'URL_METADATA') {
     entityConfidencePoints = 28;
     breakdown.push({
       name: 'Entity Confidence',
       points: isGeneric ? 14 : 28,
       maxPoints: 30,
       reason: isGeneric
-        ? 'URL metadata title (generic name penalty -50%)'
+        ? 'URL slug/metadata title (generic name penalty -50%)'
         : 'High confidence direct game URL extraction'
     });
   } else if (candidate.extraction_method === 'EXPLICIT_PATTERN') {
@@ -189,12 +189,32 @@ export function computeCandidateScore(candidate: {
   }
 
   // 6. Freshness (max 5)
-  const freshnessPoints = 5;
+  // <=24h = 5, <=72h = 3, <=7d = 1, >7d = 0
+  const earliestPostTime = candidate.posts.length > 0
+    ? Math.min(...candidate.posts.map(p => new Date(p.created_at).getTime() || Date.now()))
+    : Date.now();
+  const hoursSinceEarliest = Math.max(0, (Date.now() - earliestPostTime) / (1000 * 60 * 60));
+  let freshnessPoints = 0;
+  let freshnessReason = '';
+  if (hoursSinceEarliest <= 24) {
+    freshnessPoints = 5;
+    freshnessReason = 'Recently discovered (<=24h)';
+  } else if (hoursSinceEarliest <= 72) {
+    freshnessPoints = 3;
+    freshnessReason = 'Discovered <=72h ago';
+  } else if (hoursSinceEarliest <= 24 * 7) {
+    freshnessPoints = 1;
+    freshnessReason = 'Discovered <=7d ago';
+  } else {
+    freshnessPoints = 0;
+    freshnessReason = 'Discovered >7d ago';
+  }
+
   breakdown.push({
     name: 'Freshness',
-    points: 5,
+    points: freshnessPoints,
     maxPoints: 5,
-    reason: 'Recently discovered within current experiment window'
+    reason: freshnessReason
   });
 
   // 7. Engagement (max 5)

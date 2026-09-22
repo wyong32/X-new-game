@@ -2,14 +2,14 @@ import React, { useState } from 'react';
 import type { AppSettings } from '../types.js';
 import {
   Sliders,
-  Download,
   RotateCcw,
-  Key,
+  ShieldCheck,
   ShieldAlert,
   Save,
   X,
   CheckCircle2,
-  Database
+  Lock,
+  Cpu
 } from 'lucide-react';
 
 interface SettingsModalProps {
@@ -28,9 +28,11 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   onResetAndSeed
 }) => {
   const [mode, setMode] = useState<'mock' | 'live'>(settings.x_data_mode);
-  const [apiKey, setApiKey] = useState(settings.x_bearer_token || '');
-  const [maxPosts, setMaxPosts] = useState(settings.max_x_posts_per_run || 25);
-  const [geminiEnabled, setGeminiEnabled] = useState(settings.gemini_extraction_enabled ?? false);
+  const [maxRequests, setMaxRequests] = useState(settings.max_x_requests_per_run || 30);
+  const [maxPostsPerRun, setMaxPostsPerRun] = useState(settings.max_x_posts_per_run || 1000);
+  const [maxPostsPerQuery, setMaxPostsPerQuery] = useState(settings.max_x_posts_per_query || 100);
+  const [maxGemini, setMaxGemini] = useState(settings.max_gemini_extractions_per_run || 30);
+  const [geminiEnabled, setGeminiEnabled] = useState(settings.gemini_extraction_enabled ?? true);
   const [saving, setSaving] = useState(false);
   const [reseeding, setReseeding] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
@@ -44,8 +46,10 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
     try {
       await onUpdateSettings({
         x_data_mode: mode,
-        x_bearer_token: apiKey,
-        max_x_posts_per_run: Number(maxPosts),
+        max_x_requests_per_run: Number(maxRequests),
+        max_x_posts_per_run: Number(maxPostsPerRun),
+        max_x_posts_per_query: Number(maxPostsPerQuery),
+        max_gemini_extractions_per_run: Number(maxGemini),
         gemini_extraction_enabled: geminiEnabled
       });
       setMessage('Settings successfully updated.');
@@ -78,7 +82,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
           <div className="flex items-center space-x-2">
             <Sliders className="w-5 h-5 text-sky-400" />
             <h2 className="text-sm font-semibold text-white uppercase tracking-wider font-mono">
-              System Settings & Data Pipeline
+              System Settings & Experiment Budgets
             </h2>
           </div>
           <button
@@ -115,7 +119,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                   <span>Mock Mode</span>
                 </div>
                 <div className="text-[11px] text-slate-400 mt-1 leading-relaxed">
-                  Uses realistic test fixture posts, simulated search queries, and local rate limits without consuming X API credits.
+                  Uses realistic local test fixtures and mock pagination. Safe for development with zero API consumption.
                 </div>
               </div>
 
@@ -131,119 +135,143 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                   <span>Live X API Mode</span>
                 </div>
                 <div className="text-[11px] text-slate-400 mt-1 leading-relaxed">
-                  Connects to Twitter/X API v2 recent search endpoint using your Bearer Token.
+                  Fetches live recent tweets from X API v2 using server-side credentials only.
                 </div>
               </div>
             </div>
           </div>
 
-          {/* Section: X API Bearer Token */}
-          {mode === 'live' && (
-            <div className="space-y-1.5 bg-slate-800/50 p-3 rounded-lg border border-slate-700">
-              <label className="block text-slate-200 font-medium">X API Bearer Token:</label>
-              <div className="relative">
-                <Key className="w-4 h-4 text-slate-500 absolute left-2.5 top-2.5" />
-                <input
-                  type="password"
-                  value={apiKey}
-                  onChange={e => setApiKey(e.target.value)}
-                  placeholder="AAAAAAAAAAAAAAAAAAAAA..."
-                  className="w-full bg-slate-900 border border-slate-700 text-white text-xs rounded pl-8 pr-3 py-2 font-mono focus:outline-none focus:border-sky-500"
-                />
+          {/* Section: Server-side Secret Security Status (P0 Security) */}
+          <div className="p-3 rounded-lg border border-slate-700/80 bg-slate-800/40 space-y-2">
+            <div className="flex items-center justify-between">
+              <div className="flex items-center space-x-2 text-slate-200 font-semibold">
+                <Lock className="w-3.5 h-3.5 text-sky-400" />
+                <span>X API Token Security</span>
               </div>
-              <p className="text-[11px] text-slate-400">
-                Requires standard X Developer API Bearer Token with read permissions.
-              </p>
+              {settings.x_api_configured ? (
+                <span className="flex items-center space-x-1 text-emerald-400 bg-emerald-950/60 border border-emerald-800/50 px-2 py-0.5 rounded text-[10px] font-mono">
+                  <ShieldCheck className="w-3 h-3" />
+                  <span>Configured in Server Secrets</span>
+                </span>
+              ) : (
+                <span className="flex items-center space-x-1 text-amber-400 bg-amber-950/60 border border-amber-800/50 px-2 py-0.5 rounded text-[10px] font-mono">
+                  <ShieldAlert className="w-3 h-3" />
+                  <span>Not Configured</span>
+                </span>
+              )}
             </div>
-          )}
-
-          {/* Section: Max Posts Per Query */}
-          <div className="space-y-1.5">
-            <label className="block text-slate-300 font-medium">Max Posts Per Query Fetch:</label>
-            <input
-              type="number"
-              value={maxPosts}
-              onChange={e => setMaxPosts(Number(e.target.value))}
-              min={10}
-              max={100}
-              className="w-full bg-slate-800 border border-slate-700 text-white text-xs rounded p-2 focus:outline-none focus:border-sky-500"
-            />
-            <p className="text-[11px] text-slate-500">
-              Default is 25 posts. Caps API quota usage per execution cycle.
+            <p className="text-[11px] text-slate-400 leading-relaxed">
+              For security, <code className="text-slate-300 font-mono">X_BEARER_TOKEN</code> is strictly read from container environment secrets on the backend and is never exposed to or accepted from client UI inputs.
             </p>
           </div>
 
-          {/* Section: Gemini AI Fallback Extraction */}
-          <div className="flex items-center justify-between p-3 rounded-lg bg-slate-800/40 border border-slate-800">
-            <div>
-              <div className="font-semibold text-slate-200">Gemini AI Fallback Extraction</div>
-              <div className="text-[11px] text-slate-400">
-                Only runs on high context score (≥70) posts when deterministic patterns don't find a title.
+          {/* Section: API Budgets (P0 Budget Configuration) */}
+          <div className="space-y-3 pt-1 border-t border-slate-800">
+            <label className="block text-slate-300 font-semibold uppercase tracking-wider font-mono text-[11px]">
+              API Quotas & Execution Budgets
+            </label>
+
+            <div className="grid grid-cols-2 gap-3">
+              <div className="space-y-1">
+                <label className="text-slate-300 font-medium text-[11px]">Max X Requests / Run:</label>
+                <input
+                  type="number"
+                  value={maxRequests}
+                  onChange={e => setMaxRequests(Number(e.target.value))}
+                  min={1}
+                  max={100}
+                  className="w-full bg-slate-800 border border-slate-700 text-white text-xs rounded p-2 focus:outline-none focus:border-sky-500 font-mono"
+                />
+                <p className="text-[10px] text-slate-500">Max HTTP search requests per execution cycle</p>
+              </div>
+
+              <div className="space-y-1">
+                <label className="text-slate-300 font-medium text-[11px]">Max X Posts / Query:</label>
+                <input
+                  type="number"
+                  value={maxPostsPerQuery}
+                  onChange={e => setMaxPostsPerQuery(Number(e.target.value))}
+                  min={10}
+                  max={500}
+                  className="w-full bg-slate-800 border border-slate-700 text-white text-xs rounded p-2 focus:outline-none focus:border-sky-500 font-mono"
+                />
+                <p className="text-[10px] text-slate-500">Max posts paged per single query</p>
               </div>
             </div>
-            <input
-              type="checkbox"
-              checked={geminiEnabled}
-              onChange={e => setGeminiEnabled(e.target.checked)}
-              className="w-4 h-4 rounded text-sky-500 cursor-pointer"
-            />
+
+            <div className="grid grid-cols-2 gap-3">
+              <div className="space-y-1">
+                <label className="text-slate-300 font-medium text-[11px]">Max Total Posts / Run:</label>
+                <input
+                  type="number"
+                  value={maxPostsPerRun}
+                  onChange={e => setMaxPostsPerRun(Number(e.target.value))}
+                  min={50}
+                  max={5000}
+                  className="w-full bg-slate-800 border border-slate-700 text-white text-xs rounded p-2 focus:outline-none focus:border-sky-500 font-mono"
+                />
+                <p className="text-[10px] text-slate-500">Max posts processed across all queries</p>
+              </div>
+
+              <div className="space-y-1">
+                <label className="text-slate-300 font-medium text-[11px]">Max Gemini Extractions / Run:</label>
+                <input
+                  type="number"
+                  value={maxGemini}
+                  onChange={e => setMaxGemini(Number(e.target.value))}
+                  min={0}
+                  max={100}
+                  className="w-full bg-slate-800 border border-slate-700 text-white text-xs rounded p-2 focus:outline-none focus:border-sky-500 font-mono"
+                />
+                <p className="text-[10px] text-slate-500">Hard limit on AI extraction calls per run</p>
+              </div>
+            </div>
           </div>
 
-          <button
-            type="submit"
-            disabled={saving}
-            className="w-full bg-sky-600 hover:bg-sky-500 disabled:opacity-50 text-white py-2 rounded text-xs font-semibold shadow transition-colors flex items-center justify-center space-x-1.5"
-          >
-            <Save className="w-3.5 h-3.5" />
-            <span>Save Settings</span>
-          </button>
+          {/* Section: Gemini Fallback Toggle (P0 Gemini Limits) */}
+          <div className="space-y-2 pt-1 border-t border-slate-800">
+            <div className="flex items-center justify-between">
+              <div className="flex items-center space-x-2">
+                <Cpu className="w-4 h-4 text-indigo-400" />
+                <span className="text-slate-200 font-medium">Gemini AI Entity Extraction</span>
+              </div>
+              <label className="relative inline-flex items-center cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={geminiEnabled}
+                  onChange={e => setGeminiEnabled(e.target.checked)}
+                  className="sr-only peer"
+                />
+                <div className="w-9 h-5 bg-slate-700 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-slate-300 after:border after:rounded-full after:h-4 after:w-4 after:transition-all peer-checked:bg-indigo-600"></div>
+              </label>
+            </div>
+            <p className="text-[11px] text-slate-400 leading-relaxed">
+              When enabled, Gemini extracts game names from high-context posts that rule-based extractors miss. When disabled, 0 Gemini calls are made and candidates remain based purely on deterministic patterns.
+            </p>
+          </div>
+
+          {/* Action buttons */}
+          <div className="pt-3 border-t border-slate-800 flex items-center justify-between">
+            <button
+              type="button"
+              onClick={handleReSeed}
+              disabled={reseeding}
+              className="flex items-center space-x-1.5 px-3 py-2 bg-slate-800 hover:bg-slate-700 text-slate-300 border border-slate-700 rounded transition-colors text-xs disabled:opacity-50"
+            >
+              <RotateCcw className={`w-3.5 h-3.5 ${reseeding ? 'animate-spin' : ''}`} />
+              <span>{reseeding ? 'Resetting...' : 'Reset & Re-Seed Mock Pipeline'}</span>
+            </button>
+
+            <button
+              type="submit"
+              disabled={saving}
+              className="flex items-center space-x-1.5 px-4 py-2 bg-sky-600 hover:bg-sky-500 text-white font-medium rounded transition-colors text-xs disabled:opacity-50"
+            >
+              <Save className="w-3.5 h-3.5" />
+              <span>{saving ? 'Saving...' : 'Save Settings'}</span>
+            </button>
+          </div>
         </form>
-
-        {/* Section: CSV Exports */}
-        <div className="pt-3 border-t border-slate-800 space-y-2">
-          <div className="text-slate-300 font-semibold uppercase tracking-wider font-mono text-[11px]">
-            Data Export (CSV)
-          </div>
-          <div className="grid grid-cols-3 gap-2">
-            <a
-              href="/api/export/candidates"
-              className="p-2 bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs rounded text-center border border-slate-700 transition-colors block"
-            >
-              Candidates CSV
-            </a>
-            <a
-              href="/api/export/queries"
-              className="p-2 bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs rounded text-center border border-slate-700 transition-colors block"
-            >
-              Queries CSV
-            </a>
-            <a
-              href="/api/export/posts"
-              className="p-2 bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs rounded text-center border border-slate-700 transition-colors block"
-            >
-              Raw Posts CSV
-            </a>
-          </div>
-        </div>
-
-        {/* Section: Danger Zone - Reset and Re-seed */}
-        <div className="pt-3 border-t border-slate-800 space-y-2">
-          <div className="text-rose-400 font-semibold uppercase tracking-wider font-mono text-[11px] flex items-center space-x-1.5">
-            <ShieldAlert className="w-3.5 h-3.5" />
-            <span>Mock Database Reset & Re-run</span>
-          </div>
-          <p className="text-[11px] text-slate-400">
-            Resets all posts and candidates, reloads initial query seeds, runs the entire pipeline on the mock test suite, and applies demo ground-truth labels.
-          </p>
-          <button
-            onClick={handleReSeed}
-            disabled={reseeding}
-            className="w-full bg-slate-800 hover:bg-rose-950 text-rose-300 border border-rose-900/60 py-2 rounded text-xs font-semibold transition-colors flex items-center justify-center space-x-1.5"
-          >
-            <RotateCcw className={`w-3.5 h-3.5 ${reseeding ? 'animate-spin' : ''}`} />
-            <span>Reset Database & Re-run Mock Pipeline</span>
-          </button>
-        </div>
       </div>
     </div>
   );

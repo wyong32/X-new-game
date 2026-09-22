@@ -41,6 +41,7 @@ export interface XQuery {
 }
 
 export type ExtractionMethod =
+  | 'URL_SLUG'
   | 'URL_METADATA'
   | 'EXPLICIT_PATTERN'
   | 'HASHTAG'
@@ -83,6 +84,7 @@ export interface XPost {
   extracted_game_name?: string | null;
   extraction_method?: ExtractionMethod;
   extraction_confidence?: number;
+  extraction_status?: 'COMPLETED' | 'PENDING_EXTRACTION' | 'SKIPPED';
   candidate_processed: boolean;
   candidate_id?: string;
   human_post_label?: PostHumanLabel;
@@ -117,6 +119,18 @@ export interface ScoreFactor {
   reason: string;
 }
 
+export interface CandidateQueryEvidence {
+  id: string; // `${candidate_id}__${query_id}`
+  candidate_id: string;
+  query_id: string;
+  first_seen_at: string;
+  post_count: number;
+  unique_author_count: number;
+  is_first_discovery: boolean;
+  created_at: string;
+  updated_at: string;
+}
+
 export interface GameCandidate {
   id: string;
   canonical_name: string;
@@ -125,6 +139,7 @@ export interface GameCandidate {
   first_seen_at: string;
   last_seen_at: string;
   first_query_id: string;
+  first_discovery_query_id: string;
   source_post_ids: string[];
   source_query_ids: string[];
   unique_post_count: number;
@@ -149,13 +164,14 @@ export interface GameCandidate {
 
 export interface AppSettings {
   x_data_mode: 'mock' | 'live';
-  x_bearer_token?: string;
+  x_api_configured: boolean;
   gemini_api_key_configured: boolean;
-  gemini_extraction_enabled?: boolean;
+  gemini_extraction_enabled: boolean;
   raw_post_text_retention_days: number;
   app_timezone: string;
   max_x_requests_per_run: number;
   max_x_posts_per_run: number;
+  max_x_posts_per_query: number;
   max_gemini_extractions_per_run: number;
 }
 
@@ -170,12 +186,19 @@ export interface QueryAnalyticsSummary {
   posts_passed: number;
   pass_rate: number;
   candidates_generated: number;
+  first_discovery_candidates_count: number;
+  first_discovery_valuable_games: number;
   human_reviewed_candidates: number;
   human_valid_games: number;
   valuable_new_games: number;
   rejected_candidates: number;
+  unsure_candidates: number;
+  duplicate_candidates: number;
+  unreviewed_candidates: number;
   precision_valid_game: number;
+  validation_precision: number;
   precision_valuable_new_game: number;
+  first_discovery_valuable_yield_per_1k_posts: number;
   posts_per_valid_game: number;
   posts_per_valuable_game: number;
   yield_valuable_per_1k_posts: number;

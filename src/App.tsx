@@ -21,9 +21,11 @@ import { QueryManagement } from './components/QueryManagement.js';
 import { QueryAnalytics } from './components/QueryAnalytics.js';
 import { FeedbackAnalytics } from './components/FeedbackAnalytics.js';
 import { SettingsModal } from './components/SettingsModal.js';
-import { CheckCircle2, AlertCircle } from 'lucide-react';
+import { LoginModal } from './components/LoginModal.js';
+import { CheckCircle2 } from 'lucide-react';
 
 export default function App() {
+  const [isAuthenticated, setIsAuthenticated] = useState<boolean>(true);
   const [currentTab, setCurrentTab] = useState<string>('dashboard');
   const [selectedCandidateId, setSelectedCandidateId] = useState<string | null>(null);
 
@@ -44,6 +46,20 @@ export default function App() {
       setToastMessage(null);
     }, 4000);
   };
+
+  // Authenticated fetch wrapper
+  const authFetch = useCallback(async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+    const token = localStorage.getItem('lab_token');
+    const headers = new Headers(init?.headers);
+    if (token) {
+      headers.set('Authorization', `Bearer ${token}`);
+    }
+    const res = await fetch(input, { ...init, headers });
+    if (res.status === 401) {
+      setIsAuthenticated(false);
+    }
+    return res;
+  }, []);
 
   // Synchronize route from window.location.pathname or hash
   const syncRouteFromUrl = useCallback(() => {
@@ -80,16 +96,22 @@ export default function App() {
   const loadData = useCallback(async () => {
     try {
       const [statusRes, queriesRes, postsRes, candidatesRes] = await Promise.all([
-        fetch('/api/status'),
-        fetch('/api/queries'),
-        fetch('/api/posts'),
-        fetch('/api/candidates')
+        authFetch('/api/status'),
+        authFetch('/api/queries'),
+        authFetch('/api/posts'),
+        authFetch('/api/candidates')
       ]);
+
+      if (statusRes.status === 401) {
+        setIsAuthenticated(false);
+        return;
+      }
 
       if (statusRes.ok) {
         const s = await statusRes.json();
         setStatus(s);
         setSettings(s.settings);
+        setIsAuthenticated(true);
       }
       if (queriesRes.ok) {
         setQueries(await queriesRes.json());
@@ -105,7 +127,7 @@ export default function App() {
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [authFetch]);
 
   useEffect(() => {
     loadData();
@@ -146,7 +168,7 @@ export default function App() {
   // Label update handlers
   const handleUpdateCandidateLabel = async (id: string, label: CandidateHumanLabel) => {
     try {
-      const res = await fetch(`/api/candidates/${id}`, {
+      const res = await authFetch(`/api/candidates/${id}`, {
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ human_label: label })
@@ -162,7 +184,7 @@ export default function App() {
 
   const handleUpdateCandidate = async (id: string, partial: Partial<GameCandidate>) => {
     try {
-      const res = await fetch(`/api/candidates/${id}`, {
+      const res = await authFetch(`/api/candidates/${id}`, {
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(partial)
@@ -178,7 +200,7 @@ export default function App() {
 
   const handleMergeCandidate = async (sourceId: string, targetId: string) => {
     try {
-      const res = await fetch(`/api/candidates/${sourceId}/merge`, {
+      const res = await authFetch(`/api/candidates/${sourceId}/merge`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ target_id: targetId })
@@ -194,7 +216,7 @@ export default function App() {
 
   const handleUpdatePostLabel = async (postId: string, label: PostHumanLabel) => {
     try {
-      const res = await fetch(`/api/posts/${postId}`, {
+      const res = await authFetch(`/api/posts/${postId}`, {
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ human_post_label: label })
@@ -212,7 +234,7 @@ export default function App() {
   const handleRunQuery = async (queryId: string) => {
     setOperating(true);
     try {
-      const res = await fetch(`/api/queries/${queryId}/run`, { method: 'POST' });
+      const res = await authFetch(`/api/queries/${queryId}/run`, { method: 'POST' });
       if (res.ok) {
         const result = await res.json();
         showToast(
@@ -233,7 +255,7 @@ export default function App() {
   const handleRunBatch = async (filter: 'P1' | 'ENABLED' | 'DUE') => {
     setOperating(true);
     try {
-      const res = await fetch('/api/queries/run-batch', {
+      const res = await authFetch('/api/queries/run-batch', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ filter })
@@ -256,7 +278,7 @@ export default function App() {
 
   const handleToggleQuery = async (queryId: string, enabled: boolean) => {
     try {
-      const res = await fetch(`/api/queries/${queryId}`, {
+      const res = await authFetch(`/api/queries/${queryId}`, {
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ enabled })
@@ -272,7 +294,7 @@ export default function App() {
 
   const handleResetQueryStats = async (queryId: string) => {
     try {
-      const res = await fetch(`/api/queries/${queryId}/reset`, { method: 'POST' });
+      const res = await authFetch(`/api/queries/${queryId}/reset`, { method: 'POST' });
       if (res.ok) {
         showToast('Query statistics reset.');
         await loadData();
@@ -284,7 +306,7 @@ export default function App() {
 
   const handleAddQuery = async (queryData: Partial<XQuery>) => {
     try {
-      const res = await fetch('/api/queries', {
+      const res = await authFetch('/api/queries', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(queryData)
@@ -300,7 +322,7 @@ export default function App() {
 
   const handleUpdateSettings = async (newSettings: Partial<AppSettings>) => {
     try {
-      const res = await fetch('/api/settings', {
+      const res = await authFetch('/api/settings', {
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(newSettings)
@@ -317,7 +339,7 @@ export default function App() {
 
   const handleResetAndSeed = async () => {
     try {
-      const res = await fetch('/api/reset-and-seed', { method: 'POST' });
+      const res = await authFetch('/api/reset-and-seed', { method: 'POST' });
       if (res.ok) {
         showToast('Database reset and mock pipeline completed.');
         await loadData();
@@ -326,6 +348,17 @@ export default function App() {
       console.error(err);
     }
   };
+
+  if (!isAuthenticated) {
+    return (
+      <LoginModal
+        onLoginSuccess={() => {
+          setIsAuthenticated(true);
+          loadData();
+        }}
+      />
+    );
+  }
 
   return (
     <div className="min-h-screen bg-slate-950 text-slate-100 flex flex-col font-sans selection:bg-sky-500/30">

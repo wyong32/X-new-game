@@ -41,9 +41,10 @@ function titleCaseSlug(slug: string): string {
 }
 
 /**
- * 1. URL Evidence Extraction
+ * 1. Platform URL Slug Extraction (URL_SLUG)
+ * Parses standardized slugs from recognized platforms (itch.io, Steam, Poki, CrazyGames, GitHub Pages)
  */
-export function extractFromUrls(urls: string[]): { name: string; evidence: string } | null {
+export function extractFromUrlSlugs(urls: string[]): { name: string; evidence: string; method: 'URL_SLUG' } | null {
   for (const url of urls) {
     try {
       const parsed = new URL(url);
@@ -55,7 +56,7 @@ export function extractFromUrls(urls: string[]): { name: string; evidence: strin
           const rawSlug = parts[0];
           const name = titleCaseSlug(rawSlug);
           if (isValidExtractedName(name)) {
-            return { name, evidence: `Extracted from itch.io slug: ${url}` };
+            return { name, evidence: `Extracted from itch.io slug: ${url}`, method: 'URL_SLUG' };
           }
         }
       }
@@ -67,7 +68,7 @@ export function extractFromUrls(urls: string[]): { name: string; evidence: strin
           const rawSlug = parts[2];
           const name = titleCaseSlug(rawSlug);
           if (isValidExtractedName(name)) {
-            return { name, evidence: `Extracted from Steam store slug: ${url}` };
+            return { name, evidence: `Extracted from Steam store slug: ${url}`, method: 'URL_SLUG' };
           }
         }
       }
@@ -79,7 +80,7 @@ export function extractFromUrls(urls: string[]): { name: string; evidence: strin
         if (gIndex !== -1 && parts[gIndex + 1]) {
           const name = titleCaseSlug(parts[gIndex + 1]);
           if (isValidExtractedName(name)) {
-            return { name, evidence: `Extracted from Poki game slug: ${url}` };
+            return { name, evidence: `Extracted from Poki game slug: ${url}`, method: 'URL_SLUG' };
           }
         }
       }
@@ -91,19 +92,18 @@ export function extractFromUrls(urls: string[]): { name: string; evidence: strin
         if (gameIndex !== -1 && parts[gameIndex + 1]) {
           const name = titleCaseSlug(parts[gameIndex + 1]);
           if (isValidExtractedName(name)) {
-            return { name, evidence: `Extracted from CrazyGames slug: ${url}` };
+            return { name, evidence: `Extracted from CrazyGames slug: ${url}`, method: 'URL_SLUG' };
           }
         }
       }
 
-      // Newgrounds: https://www.newgrounds.com/portal/view/123456 (title usually in hash or path)
       // GitHub Pages: https://user.github.io/game-title/
       if (parsed.hostname.endsWith('github.io')) {
         const parts = parsed.pathname.split('/').filter(Boolean);
         if (parts.length >= 1) {
           const name = titleCaseSlug(parts[0]);
           if (isValidExtractedName(name)) {
-            return { name, evidence: `Extracted from GitHub Pages repository slug: ${url}` };
+            return { name, evidence: `Extracted from GitHub Pages repository slug: ${url}`, method: 'URL_SLUG' };
           }
         }
       }
@@ -113,6 +113,9 @@ export function extractFromUrls(urls: string[]): { name: string; evidence: strin
   }
   return null;
 }
+
+// Backward compatibility alias
+export const extractFromUrls = extractFromUrlSlugs;
 
 /**
  * 2. Explicit Language Patterns

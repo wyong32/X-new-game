@@ -4,11 +4,8 @@ import type {
   XQuery,
   XPost,
   GameCandidate,
-  AppSettings,
-  QueryCategory,
-  QueryPriority,
-  CandidateStatus,
-  CandidateHumanLabel
+  CandidateQueryEvidence,
+  AppSettings
 } from '../../src/types.js';
 import { INITIAL_QUERIES } from '../fixtures/seedQueries.js';
 
@@ -16,50 +13,77 @@ interface DatabaseSchema {
   queries: Record<string, XQuery>;
   posts: Record<string, XPost>;
   candidates: Record<string, GameCandidate>;
+  candidate_query_evidence: Record<string, CandidateQueryEvidence>;
   settings: AppSettings;
 }
 
 const DATA_DIR = path.resolve(process.cwd(), 'data');
 const DB_FILE = path.join(DATA_DIR, 'db.json');
+const DB_TMP_FILE = path.join(DATA_DIR, 'db.json.tmp');
 
-const DEFAULT_SETTINGS: AppSettings = {
-  x_data_mode: (process.env.X_DATA_MODE as 'mock' | 'live') || 'mock',
-  x_bearer_token: process.env.X_BEARER_TOKEN || '',
-  gemini_api_key_configured: Boolean(process.env.GEMINI_API_KEY && process.env.GEMINI_API_KEY !== 'MY_GEMINI_API_KEY'),
-  raw_post_text_retention_days: Number(process.env.RAW_POST_TEXT_RETENTION_DAYS) || 14,
-  app_timezone: process.env.APP_TIMEZONE || 'Asia/Jakarta',
-  max_x_requests_per_run: Number(process.env.MAX_X_REQUESTS_PER_RUN) || 30,
-  max_x_posts_per_run: Number(process.env.MAX_X_POSTS_PER_RUN) || 1000,
-  max_gemini_extractions_per_run: Number(process.env.MAX_GEMINI_EXTRACTIONS_PER_RUN) || 30
-};
+function getBaseDefaultSettings(): AppSettings {
+  return {
+    x_data_mode: (process.env.X_DATA_MODE as 'mock' | 'live') || 'mock',
+    x_api_configured: Boolean(process.env.X_BEARER_TOKEN && process.env.X_BEARER_TOKEN.trim().length > 0),
+    gemini_api_key_configured: Boolean(
+      process.env.GEMINI_API_KEY && process.env.GEMINI_API_KEY !== 'MY_GEMINI_API_KEY'
+    ),
+    gemini_extraction_enabled: process.env.GEMINI_EXTRACTION_ENABLED !== 'false',
+    raw_post_text_retention_days: Number(process.env.RAW_POST_TEXT_RETENTION_DAYS) || 14,
+    app_timezone: process.env.APP_TIMEZONE || 'Asia/Jakarta',
+    max_x_requests_per_run: Number(process.env.MAX_X_REQUESTS_PER_RUN) || 30,
+    max_x_posts_per_run: Number(process.env.MAX_X_POSTS_PER_RUN) || 1000,
+    max_x_posts_per_query: Number(process.env.MAX_X_POSTS_PER_QUERY) || 100,
+    max_gemini_extractions_per_run: Number(process.env.MAX_GEMINI_EXTRACTIONS_PER_RUN) || 30
+  };
+}
 
-class MemoryStore {
+export class MemoryStore {
   private data: DatabaseSchema;
   private saveTimeout: NodeJS.Timeout | null = null;
+  private customDbFile?: string;
 
-  constructor() {
+  constructor(customDbFile?: string) {
+    this.customDbFile = customDbFile;
     this.data = {
       queries: {},
       posts: {},
       candidates: {},
-      settings: { ...DEFAULT_SETTINGS }
+      candidate_query_evidence: {},
+      settings: getBaseDefaultSettings()
     };
     this.loadFromDisk();
   }
 
+  public async init() {
+    return Promise.resolve();
+  }
+
   private loadFromDisk() {
     try {
-      if (!fs.existsSync(DATA_DIR)) {
-        fs.mkdirSync(DATA_DIR, { recursive: true });
+      const targetDir = this.customDbFile ? path.dirname(this.customDbFile) : DATA_DIR;
+      const targetFile = this.customDbFile || DB_FILE;
+      if (!fs.existsSync(targetDir)) {
+        fs.mkdirSync(targetDir, { recursive: true });
       }
-      if (fs.existsSync(DB_FILE)) {
-        const raw = fs.readFileSync(DB_FILE, 'utf-8');
+      if (fs.existsSync(targetFile)) {
+        const raw = fs.readFileSync(targetFile, 'utf-8');
         const parsed = JSON.parse(raw);
+
+        // Security check: ensure no legacy x_bearer_token lingers in parsed data
+        if (parsed.settings && 'x_bearer_token' in parsed.settings) {
+          delete parsed.settings.x_bearer_token;
+        }
+
         this.data = {
           queries: parsed.queries || {},
           posts: parsed.posts || {},
           candidates: parsed.candidates || {},
-          settings: { ...DEFAULT_SETTINGS, ...(parsed.settings || {}) }
+          candidate_query_evidence: parsed.candidate_query_evidence || {},
+          settings: {
+            ...getBaseDefaultSettings(),
+            ...(parsed.settings || {})
+          }
         };
       } else {
         // Initial setup
@@ -74,12 +98,33 @@ class MemoryStore {
 
   public saveToDiskSync() {
     try {
-      if (!fs.existsSync(DATA_DIR)) {
-        fs.mkdirSync(DATA_DIR, { recursive: true });
+      const targetDir = this.customDbFile ? path.dirname(this.customDbFile) : DATA_DIR;
+      const targetFile = this.customDbFile || DB_FILE;
+      const targetTmp = this.customDbFile ? `${this.customDbFile}.tmp` : DB_TMP_FILE;
+
+      if (!fs.existsSync(targetDir)) {
+        fs.mkdirSync(targetDir, { recursive: true });
       }
-      fs.writeFileSync(DB_FILE, JSON.stringify(this.data, null, 2), 'utf-8');
+
+      // Scrub any sensitive fields before persisting
+      const sanitizedSettings = { ...this.data.settings };
+      if ('x_bearer_token' in (sanitizedSettings as any)) {
+        delete (sanitizedSettings as any).x_bearer_token;
+      }
+
+      const payload = {
+        queries: this.data.queries,
+        posts: this.data.posts,
+        candidates: this.data.candidates,
+        candidate_query_evidence: this.data.candidate_query_evidence,
+        settings: sanitizedSettings
+      };
+
+      // Atomic write pattern: write to tmp file first, then atomic rename
+      fs.writeFileSync(targetTmp, JSON.stringify(payload, null, 2), 'utf-8');
+      fs.renameSync(targetTmp, targetFile);
     } catch (err) {
-      console.error('Error saving database to disk:', err);
+      console.error('Error saving database atomically to disk:', err);
     }
   }
 
@@ -198,33 +243,82 @@ class MemoryStore {
   public deleteCandidate(id: string): boolean {
     if (this.data.candidates[id]) {
       delete this.data.candidates[id];
+      // Also delete evidence records for this candidate
+      for (const [key, ev] of Object.entries(this.data.candidate_query_evidence)) {
+        if (ev.candidate_id === id) {
+          delete this.data.candidate_query_evidence[key];
+        }
+      }
       this.scheduleDiskSave();
       return true;
     }
     return false;
   }
 
+  // --- CANDIDATE QUERY EVIDENCE ---
+  public getCandidateQueryEvidenceList(): CandidateQueryEvidence[] {
+    return Object.values(this.data.candidate_query_evidence);
+  }
+
+  public getCandidateQueryEvidence(id: string): CandidateQueryEvidence | undefined {
+    return this.data.candidate_query_evidence[id];
+  }
+
+  public saveCandidateQueryEvidence(evidence: CandidateQueryEvidence): CandidateQueryEvidence {
+    const now = new Date().toISOString();
+    evidence.updated_at = now;
+    this.data.candidate_query_evidence[evidence.id] = evidence;
+    this.scheduleDiskSave();
+    return evidence;
+  }
+
+  public getCandidateQueryEvidenceByCandidate(candidateId: string): CandidateQueryEvidence[] {
+    return Object.values(this.data.candidate_query_evidence).filter(e => e.candidate_id === candidateId);
+  }
+
+  public getCandidateQueryEvidenceByQuery(queryId: string): CandidateQueryEvidence[] {
+    return Object.values(this.data.candidate_query_evidence).filter(e => e.query_id === queryId);
+  }
+
   // --- SETTINGS ---
   public getSettings(): AppSettings {
-    this.data.settings.gemini_api_key_configured = Boolean(
+    const liveXConfigured = Boolean(process.env.X_BEARER_TOKEN && process.env.X_BEARER_TOKEN.trim().length > 0);
+    const geminiConfigured = Boolean(
       process.env.GEMINI_API_KEY && process.env.GEMINI_API_KEY !== 'MY_GEMINI_API_KEY'
     );
-    return { ...this.data.settings };
+
+    this.data.settings.x_api_configured = liveXConfigured;
+    this.data.settings.gemini_api_key_configured = geminiConfigured;
+
+    // Ensure no secret is ever in returned settings
+    const safeCopy: AppSettings = { ...this.data.settings };
+    if ('x_bearer_token' in (safeCopy as any)) {
+      delete (safeCopy as any).x_bearer_token;
+    }
+    return safeCopy;
   }
 
   public updateSettings(partial: Partial<AppSettings>): AppSettings {
+    // Strictly reject and strip any attempted secret injection through settings API
+    const safePartial = { ...partial };
+    if ('x_bearer_token' in (safePartial as any)) {
+      delete (safePartial as any).x_bearer_token;
+    }
+
     this.data.settings = {
       ...this.data.settings,
-      ...partial
+      ...safePartial,
+      x_api_configured: Boolean(process.env.X_BEARER_TOKEN && process.env.X_BEARER_TOKEN.trim().length > 0)
     };
     this.scheduleDiskSave();
-    return { ...this.data.settings };
+    return this.getSettings();
   }
 
   public resetAll() {
     this.data.posts = {};
     this.data.candidates = {};
     this.data.queries = {};
+    this.data.candidate_query_evidence = {};
     this.seedInitialQueries();
     this.saveToDiskSync();
   }

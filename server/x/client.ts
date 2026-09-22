@@ -33,27 +33,68 @@ export interface XSearchResult {
   };
 }
 
+export interface XSearchParams {
+  query: string;
+  sinceId?: string;
+  maxResults?: number;
+  nextToken?: string;
+}
+
 export interface XSearchClient {
-  searchRecent(params: {
-    query: string;
-    sinceId?: string;
-    maxResults?: number;
-  }): Promise<XSearchResult>;
+  searchRecent(params: XSearchParams): Promise<XSearchResult>;
 }
 
 export class MockXClient implements XSearchClient {
-  async searchRecent(params: {
-    query: string;
-    sinceId?: string;
-    maxResults?: number;
-  }): Promise<XSearchResult> {
+  private customFixtures?: XSearchResultItem[];
+
+  constructor(customFixtures?: XSearchResultItem[]) {
+    this.customFixtures = customFixtures;
+  }
+
+  async searchRecent(params: XSearchParams): Promise<XSearchResult> {
+    const pageSize = Math.min(100, Math.max(10, params.maxResults || 25));
+
+    // If custom fixtures are supplied (e.g. for multi-page integration test)
+    if (this.customFixtures) {
+      let startIndex = 0;
+      if (params.nextToken && params.nextToken.startsWith('mock_offset_')) {
+        startIndex = parseInt(params.nextToken.replace('mock_offset_', ''), 10) || 0;
+      }
+
+      // Filter by sinceId if provided (posts with numeric ID > sinceId)
+      let available = this.customFixtures;
+      if (params.sinceId) {
+        available = available.filter(p => BigInt(p.id) > BigInt(params.sinceId!));
+      }
+
+      const paged = available.slice(startIndex, startIndex + pageSize);
+      const nextOffset = startIndex + pageSize;
+      const hasMore = nextOffset < available.length;
+
+      return {
+        data: paged,
+        meta: {
+          result_count: paged.length,
+          newest_id: paged.length > 0 ? paged[0].id : undefined,
+          oldest_id: paged.length > 0 ? paged[paged.length - 1].id : undefined,
+          next_token: hasMore ? `mock_offset_${nextOffset}` : undefined
+        }
+      };
+    }
+
     const rawQuery = params.query.toLowerCase().replace(/['"]/g, '');
-    const keywords = rawQuery.split(/\s+/).filter(w => w.length > 2 && !w.startsWith('-') && !w.startsWith('lang:'));
+    const keywords = rawQuery
+      .split(/\s+/)
+      .filter(w => w.length > 2 && !w.startsWith('-') && !w.startsWith('lang:'));
 
     // Filter matching fixtures
     const matched = MOCK_POSTS_FIXTURES.filter(f => {
       // 1. Direct query matching mapping
-      if (f.matching_query_texts.some(q => q.toLowerCase().includes(rawQuery) || rawQuery.includes(q.toLowerCase().replace(/['"]/g, '')))) {
+      if (
+        f.matching_query_texts.some(
+          q => q.toLowerCase().includes(rawQuery) || rawQuery.includes(q.toLowerCase().replace(/['"]/g, ''))
+        )
+      ) {
         return true;
       }
       // 2. Keyword fallback in post text
@@ -62,7 +103,12 @@ export class MockXClient implements XSearchClient {
       return hasKeywords;
     });
 
-    const results: XSearchResultItem[] = matched.slice(0, params.maxResults || 20).map(m => ({
+    let startIndex = 0;
+    if (params.nextToken && params.nextToken.startsWith('mock_offset_')) {
+      startIndex = parseInt(params.nextToken.replace('mock_offset_', ''), 10) || 0;
+    }
+
+    const allMapped: XSearchResultItem[] = matched.map(m => ({
       id: m.x_post_id,
       text: m.text,
       author_id: m.author_id,
@@ -82,11 +128,22 @@ export class MockXClient implements XSearchClient {
       media_types: m.media_types
     }));
 
+    // Filter by sinceId if specified
+    const filtered = params.sinceId
+      ? allMapped.filter(p => BigInt(p.id) > BigInt(params.sinceId!))
+      : allMapped;
+
+    const results = filtered.slice(startIndex, startIndex + pageSize);
+    const nextOffset = startIndex + pageSize;
+    const hasMore = nextOffset < filtered.length;
+
     return {
       data: results,
       meta: {
         result_count: results.length,
-        newest_id: results.length > 0 ? results[0].id : undefined
+        newest_id: results.length > 0 ? results[0].id : undefined,
+        oldest_id: results.length > 0 ? results[results.length - 1].id : undefined,
+        next_token: hasMore ? `mock_offset_${nextOffset}` : undefined
       }
     };
   }
@@ -95,22 +152,22 @@ export class MockXClient implements XSearchClient {
 export class LiveXClient implements XSearchClient {
   private bearerToken: string;
 
-  constructor(token?: string) {
-    this.bearerToken = token || process.env.X_BEARER_TOKEN || '';
+  constructor() {
+    this.bearerToken = (process.env.X_BEARER_TOKEN || '').trim();
   }
 
-  async searchRecent(params: {
-    query: string;
-    sinceId?: string;
-    maxResults?: number;
-  }): Promise<XSearchResult> {
+  async searchRecent(params: XSearchParams): Promise<XSearchResult> {
     if (!this.bearerToken) {
-      throw new Error('X_BEARER_TOKEN is not configured. Please switch to MOCK mode or provide X API token in settings.');
+      throw new Error(
+        'X_BEARER_TOKEN is not configured in server environment secrets. Please set X_BEARER_TOKEN in environment or switch to MOCK mode.'
+      );
     }
 
     const url = new URL('https://api.twitter.com/2/tweets/search/recent');
     url.searchParams.set('query', params.query);
-    url.searchParams.set('max_results', String(Math.min(100, Math.max(10, params.maxResults || 20))));
+    // Twitter v2 search recent max_results is between 10 and 100
+    const pageSize = Math.min(100, Math.max(10, params.maxResults || 25));
+    url.searchParams.set('max_results', String(pageSize));
     url.searchParams.set('tweet.fields', 'created_at,public_metrics,entities,attachments,lang');
     url.searchParams.set('expansions', 'author_id,attachments.media_keys');
     url.searchParams.set('user.fields', 'username,name');
@@ -120,10 +177,14 @@ export class LiveXClient implements XSearchClient {
       url.searchParams.set('since_id', params.sinceId);
     }
 
+    if (params.nextToken) {
+      url.searchParams.set('next_token', params.nextToken);
+    }
+
     const response = await fetch(url.toString(), {
       headers: {
         Authorization: `Bearer ${this.bearerToken}`,
-        'User-Agent': 'XGameDiscoveryLab/0.1'
+        'User-Agent': 'XGameDiscoveryLab/1.0'
       }
     });
 
@@ -192,9 +253,9 @@ export class LiveXClient implements XSearchClient {
   }
 }
 
-export function getXClient(mode: 'mock' | 'live', token?: string): XSearchClient {
+export function getXClient(mode: 'mock' | 'live', customFixtures?: XSearchResultItem[]): XSearchClient {
   if (mode === 'live') {
-    return new LiveXClient(token);
+    return new LiveXClient();
   }
-  return new MockXClient();
+  return new MockXClient(customFixtures);
 }

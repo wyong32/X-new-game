@@ -1,13 +1,14 @@
 import { store } from '../db/store.js';
-import { getXClient } from '../x/client.js';
+import { getXClient, type XSearchClient, type XSearchResultItem } from '../x/client.js';
 import { hardFilterPost } from './hardFilter.js';
 import { calculateGameContextScore } from './gameContext.js';
 import {
-  extractFromUrls,
+  extractFromUrlSlugs,
   extractFromExplicitPatterns,
   extractFromKnownAliases,
   extractFromHeuristics
 } from './entityExtraction.js';
+import { fetchSafePageMetadata } from './urlMetadataFetcher.js';
 import { extractGameWithGemini } from './geminiExtraction.js';
 import { normalizeGameName, cleanCanonicalTitle } from './normalization.js';
 import {
@@ -15,50 +16,130 @@ import {
   determineCandidateStatus,
   shouldMergeCandidates
 } from './candidateService.js';
-import type { XPost, GameCandidate, ExtractionMethod, CandidateHumanLabel } from '../../src/types.js';
+import { buildLiveQuery } from './queryBuilder.js';
+import type {
+  XPost,
+  GameCandidate,
+  ExtractionMethod,
+  CandidateQueryEvidence
+} from '../../src/types.js';
 
 export interface RunQueryResult {
   query_id: string;
+  requests_used: number;
   posts_fetched: number;
   posts_passed: number;
   candidates_created: number;
   candidates_updated: number;
+  gemini_calls_used: number;
+  pagination_stopped_reason: 'EXHAUSTED' | 'MAX_POSTS_REACHED' | 'MAX_REQUESTS_REACHED' | 'ERROR';
+  cursor_advanced: boolean;
   error?: string;
 }
 
-export async function runQuery(queryId: string): Promise<RunQueryResult> {
+export interface RunQueryOptions {
+  customClient?: XSearchClient;
+  maxRequestsOverride?: number;
+  maxPostsOverride?: number;
+}
+
+export async function runQuery(
+  queryId: string,
+  options: RunQueryOptions = {}
+): Promise<RunQueryResult> {
   const query = store.getQuery(queryId);
   if (!query) {
     throw new Error(`Query ${queryId} not found`);
   }
 
   const settings = store.getSettings();
-  const client = getXClient(settings.x_data_mode, settings.x_bearer_token);
+  const client = options.customClient || getXClient(settings.x_data_mode);
 
-  let fetchedPostsCount = 0;
+  // Dedicated limit variables
+  const maxRequestsLimit = options.maxRequestsOverride ?? settings.max_x_requests_per_run ?? 30;
+  const maxPostsLimit = options.maxPostsOverride ?? settings.max_x_posts_per_query ?? 100;
+  const maxGeminiLimit = settings.max_gemini_extractions_per_run ?? 30;
+  const isGeminiEnabled = Boolean(settings.gemini_extraction_enabled);
+
+  let requestsUsed = 0;
+  let totalPostsFetched = 0;
   let passedPostsCount = 0;
   let candidatesCreated = 0;
   let candidatesUpdated = 0;
+  let geminiCallsUsed = 0;
+  let newestIdSeen: string | undefined = undefined;
+  let currentNextToken: string | undefined = undefined;
+  let stoppedReason: RunQueryResult['pagination_stopped_reason'] = 'EXHAUSTED';
+  let cursorAdvanced = false;
+
+  const rawBatchItems: XSearchResultItem[] = [];
+
+  // Query formatting: in live mode, ensure standard English discovery filters
+  const effectiveQueryText = settings.x_data_mode === 'live'
+    ? buildLiveQuery(query.query_text)
+    : query.query_text;
 
   try {
-    const searchRes = await client.searchRecent({
-      query: query.query_text,
-      sinceId: query.last_since_id,
-      maxResults: settings.max_x_requests_per_run || 20
-    });
+    // -------------------------------------------------------------
+    // P0 - STEP 1: X RECENT-SEARCH PAGINATION LOOP
+    // -------------------------------------------------------------
+    while (true) {
+      if (requestsUsed >= maxRequestsLimit) {
+        stoppedReason = 'MAX_REQUESTS_REACHED';
+        break;
+      }
+      if (totalPostsFetched >= maxPostsLimit) {
+        stoppedReason = 'MAX_POSTS_REACHED';
+        break;
+      }
 
+      const pageSize = Math.min(100, Math.max(10, maxPostsLimit - totalPostsFetched));
+
+      const searchRes = await client.searchRecent({
+        query: effectiveQueryText,
+        sinceId: query.last_since_id,
+        maxResults: pageSize,
+        nextToken: currentNextToken
+      });
+      requestsUsed++;
+
+      if (!searchRes.data || searchRes.data.length === 0) {
+        stoppedReason = 'EXHAUSTED';
+        currentNextToken = undefined;
+        break;
+      }
+
+      // Record the newest_id seen on the first page
+      if (!newestIdSeen && searchRes.meta.newest_id) {
+        newestIdSeen = searchRes.meta.newest_id;
+      }
+
+      totalPostsFetched += searchRes.data.length;
+      rawBatchItems.push(...searchRes.data);
+
+      if (searchRes.meta.next_token) {
+        currentNextToken = searchRes.meta.next_token;
+      } else {
+        stoppedReason = 'EXHAUSTED';
+        currentNextToken = undefined;
+        break;
+      }
+    }
+
+    // -------------------------------------------------------------
+    // P0 - STEP 2: PROCESS & PERSIST POSTS + CANDIDATES
+    // -------------------------------------------------------------
     const now = new Date().toISOString();
-    fetchedPostsCount = searchRes.data.length;
 
-    for (const item of searchRes.data) {
-      // 1. Check if post already exists in database
+    for (const item of rawBatchItems) {
+      // 1. Check if post already exists in database (deduplication)
       let post = store.getPostByXId(item.id);
 
       const urls = (item.entities?.urls || []).map(u => u.expanded_url || u.url).filter(Boolean);
-      const hashtags = (item.entities?.hashtags || []).map(h => h.tag.startsWith('#') ? h.tag : `#${h.tag}`);
+      const hashtags = (item.entities?.hashtags || []).map(h => (h.tag.startsWith('#') ? h.tag : `#${h.tag}`));
 
       if (post) {
-        // Append query if not already present
+        // Post already exists: update query attribution if new query
         if (!post.query_ids.includes(query.id)) {
           post.query_ids.push(query.id);
           post.updated_at = now;
@@ -81,15 +162,33 @@ export async function runQuery(queryId: string): Promise<RunQueryResult> {
         let extractionMethod: ExtractionMethod = 'HEURISTIC';
         let extractionConfidence = 0.5;
 
-        // 1. URL evidence
-        const urlExt = extractFromUrls(urls);
-        if (urlExt) {
-          extractedName = urlExt.name;
-          extractionMethod = 'URL_METADATA';
+        // 1. Platform URL Slug Extraction (URL_SLUG)
+        const slugExt = extractFromUrlSlugs(urls);
+        if (slugExt) {
+          extractedName = slugExt.name;
+          extractionMethod = 'URL_SLUG';
           extractionConfidence = 0.95;
         }
 
-        // 2. Explicit patterns
+        // 2. Safe Server-Side Page Metadata Extraction (URL_METADATA) for external/custom domains
+        if (!extractedName && urls.length > 0 && filterRes.passed) {
+          // Attempt metadata fetch on first safe URL
+          for (const u of urls.slice(0, 2)) {
+            try {
+              const meta = await fetchSafePageMetadata(u);
+              if (meta && meta.extractedGameName) {
+                extractedName = meta.extractedGameName;
+                extractionMethod = 'URL_METADATA';
+                extractionConfidence = 0.92;
+                break;
+              }
+            } catch {
+              // Ignore fetch error and continue down extraction pipeline
+            }
+          }
+        }
+
+        // 3. Explicit language patterns
         if (!extractedName) {
           const patExt = extractFromExplicitPatterns(item.text);
           if (patExt) {
@@ -99,7 +198,7 @@ export async function runQuery(queryId: string): Promise<RunQueryResult> {
           }
         }
 
-        // 3. Known Aliases
+        // 4. Known Aliases
         if (!extractedName) {
           const known = store.getCandidates().map(c => ({
             canonical_name: c.canonical_name,
@@ -114,7 +213,7 @@ export async function runQuery(queryId: string): Promise<RunQueryResult> {
           }
         }
 
-        // 4. Hashtags / Heuristics
+        // 5. Hashtags / Heuristics
         if (!extractedName) {
           const heurExt = extractFromHeuristics(item.text, hashtags);
           if (heurExt) {
@@ -124,13 +223,30 @@ export async function runQuery(queryId: string): Promise<RunQueryResult> {
           }
         }
 
-        // 5. Gemini fallback (only if score >= 50 and deterministic failed)
+        // 6. Gemini fallback: strictly enforce isGeminiEnabled and cap limit
+        let extractionStatus: 'COMPLETED' | 'PENDING_EXTRACTION' | 'SKIPPED' = 'COMPLETED';
         if (!extractedName && contextRes.score >= 50 && filterRes.passed) {
-          const geminiRes = await extractGameWithGemini(item.text, urls);
-          if (geminiRes && geminiRes.is_specific_game && geminiRes.game_name) {
-            extractedName = geminiRes.game_name;
-            extractionMethod = 'GEMINI';
-            extractionConfidence = geminiRes.confidence || 0.85;
+          if (!isGeminiEnabled) {
+            // Gemini disabled: zero calls made!
+            extractionStatus = 'SKIPPED';
+          } else if (geminiCallsUsed >= maxGeminiLimit) {
+            // Cap reached: mark as PENDING_EXTRACTION without discarding
+            extractionStatus = 'PENDING_EXTRACTION';
+          } else {
+            // Make Gemini call
+            geminiCallsUsed++;
+            try {
+              const geminiRes = await extractGameWithGemini(item.text, urls);
+              if (geminiRes && geminiRes.is_specific_game && geminiRes.game_name) {
+                extractedName = geminiRes.game_name;
+                extractionMethod = 'GEMINI';
+                extractionConfidence = geminiRes.confidence || 0.85;
+                extractionStatus = 'COMPLETED';
+              }
+            } catch (err) {
+              console.error('Gemini extraction error:', err);
+              extractionStatus = 'PENDING_EXTRACTION';
+            }
           }
         }
 
@@ -159,6 +275,7 @@ export async function runQuery(queryId: string): Promise<RunQueryResult> {
           extracted_game_name: extractedName,
           extraction_method: extractedName ? extractionMethod : undefined,
           extraction_confidence: extractedName ? extractionConfidence : undefined,
+          extraction_status: extractionStatus,
           candidate_processed: false,
           created_at_db: now,
           updated_at: now
@@ -171,7 +288,7 @@ export async function runQuery(queryId: string): Promise<RunQueryResult> {
         passedPostsCount++;
       }
 
-      // Candidate Processing (threshold >= 50 and has extracted name)
+      // Candidate Processing (context score >= 50 and has extracted name)
       if (
         post.hard_filter_status === 'PASSED' &&
         post.game_context_score >= 50 &&
@@ -180,7 +297,7 @@ export async function runQuery(queryId: string): Promise<RunQueryResult> {
         const canonicalName = cleanCanonicalTitle(post.extracted_game_name);
         const normName = normalizeGameName(canonicalName);
 
-        // Find existing candidate to cluster/merge with
+        // Find existing candidate to cluster with
         const allCandidates = store.getCandidates();
         const existingCandidate = allCandidates.find(c =>
           shouldMergeCandidates(
@@ -263,10 +380,30 @@ export async function runQuery(queryId: string): Promise<RunQueryResult> {
           post.candidate_processed = true;
           store.savePost(post);
           candidatesUpdated++;
+
+          // Update candidate_query_evidence
+          const evidenceKey = `${existingCandidate.id}__${query.id}`;
+          const existingEvidence = store.getCandidateQueryEvidence(evidenceKey);
+          const postsFromThisQuery = contributingPosts.filter(p => p.query_ids.includes(query.id));
+          const authorsFromThisQuery = new Set(postsFromThisQuery.map(p => p.author_id)).size;
+
+          const updatedEvidence: CandidateQueryEvidence = {
+            id: evidenceKey,
+            candidate_id: existingCandidate.id,
+            query_id: query.id,
+            first_seen_at: existingEvidence ? existingEvidence.first_seen_at : post.created_at,
+            post_count: postsFromThisQuery.length,
+            unique_author_count: authorsFromThisQuery,
+            is_first_discovery: existingCandidate.first_discovery_query_id === query.id,
+            created_at: existingEvidence ? existingEvidence.created_at : now,
+            updated_at: now
+          };
+          store.saveCandidateQueryEvidence(updatedEvidence);
         } else {
           // Create new Candidate entity
           const candId = `cand_${normName.replace(/[^a-z0-9]/g, '_')}_${Date.now()}`;
-          const isBrowser = post.game_context_positive_reasons.some(r => r.includes('Browser/web')) ||
+          const isBrowser =
+            post.game_context_positive_reasons.some(r => r.includes('Browser/web')) ||
             post.urls.some(u => /(?:poki|crazygames|html5|webgl)/i.test(u));
 
           const scored = computeCandidateScore({
@@ -285,6 +422,7 @@ export async function runQuery(queryId: string): Promise<RunQueryResult> {
             first_seen_at: post.created_at,
             last_seen_at: post.created_at,
             first_query_id: query.id,
+            first_discovery_query_id: query.id, // P1 attribution requirement
             source_post_ids: [post.id],
             source_query_ids: [query.id],
             unique_post_count: 1,
@@ -308,18 +446,48 @@ export async function runQuery(queryId: string): Promise<RunQueryResult> {
           post.candidate_processed = true;
           store.savePost(post);
           candidatesCreated++;
+
+          // Create initial CandidateQueryEvidence
+          store.saveCandidateQueryEvidence({
+            id: `${candId}__${query.id}`,
+            candidate_id: candId,
+            query_id: query.id,
+            first_seen_at: post.created_at,
+            post_count: 1,
+            unique_author_count: 1,
+            is_first_discovery: true,
+            created_at: now,
+            updated_at: now
+          });
         }
       }
     }
 
-    // Refresh query aggregated stats
+    // -------------------------------------------------------------
+    // P0 - STEP 3: SAFE CURSOR ADVANCEMENT
+    // -------------------------------------------------------------
+    // "Never move last_since_id past unprocessed results.
+    // Stop only when no next_token OR max posts/requests reached."
+    // Only advance last_since_id if all pages were completely processed (no remaining next_token)
+    let newSinceId = query.last_since_id;
+    if (!currentNextToken && newestIdSeen) {
+      newSinceId = newestIdSeen;
+      cursorAdvanced = true;
+    }
+
+    // -------------------------------------------------------------
+    // P1 - STEP 4: RECALCULATE QUERY AGGREGATED STATS
+    // -------------------------------------------------------------
     const allPosts = store.getPosts().filter(p => p.query_ids.includes(query.id));
     const passedFilterPosts = allPosts.filter(p => p.hard_filter_status === 'PASSED');
     const associatedCandidates = store.getCandidates().filter(c => c.source_query_ids.includes(query.id));
 
+    // Standardized denominator:
+    // Exclude UNSURE, DUPLICATE, UNREVIEWED from valid precision denominator
     const humanValid = associatedCandidates.filter(
       c => c.human_label === 'VALID_GAME' || c.human_label === 'VALUABLE_NEW_GAME'
     ).length;
+
     const humanRejected = associatedCandidates.filter(
       c =>
         c.human_label === 'NOT_A_GAME' ||
@@ -328,12 +496,13 @@ export async function runQuery(queryId: string): Promise<RunQueryResult> {
         c.human_label === 'WRONG_GAME_NAME' ||
         c.human_label === 'GAME_NOT_TARGET'
     ).length;
+
     const valuableNew = associatedCandidates.filter(
       c => c.human_label === 'VALUABLE_NEW_GAME'
     ).length;
 
-    const totalReviewed = humanValid + humanRejected;
-    const precision = totalReviewed > 0 ? Math.round((humanValid / totalReviewed) * 100) : 0;
+    const standardDenominator = humanValid + humanRejected;
+    const precision = standardDenominator > 0 ? Math.round((humanValid / standardDenominator) * 100) : 0;
 
     store.updateQuery(query.id, {
       posts_collected: allPosts.length,
@@ -343,7 +512,7 @@ export async function runQuery(queryId: string): Promise<RunQueryResult> {
       human_rejected: humanRejected,
       valuable_new_games: valuableNew,
       precision,
-      last_since_id: searchRes.meta.newest_id || query.last_since_id,
+      last_since_id: newSinceId,
       last_run_at: now,
       last_status: 'SUCCESS',
       last_error: undefined
@@ -351,10 +520,14 @@ export async function runQuery(queryId: string): Promise<RunQueryResult> {
 
     return {
       query_id: query.id,
-      posts_fetched: fetchedPostsCount,
+      requests_used: requestsUsed,
+      posts_fetched: totalPostsFetched,
       posts_passed: passedPostsCount,
       candidates_created: candidatesCreated,
-      candidates_updated: candidatesUpdated
+      candidates_updated: candidatesUpdated,
+      gemini_calls_used: geminiCallsUsed,
+      pagination_stopped_reason: stoppedReason,
+      cursor_advanced: cursorAdvanced
     };
   } catch (err: any) {
     const errMsg = err?.message || String(err);
@@ -365,170 +538,60 @@ export async function runQuery(queryId: string): Promise<RunQueryResult> {
     });
     return {
       query_id: query.id,
-      posts_fetched: 0,
-      posts_passed: 0,
-      candidates_created: 0,
-      candidates_updated: 0,
+      requests_used: requestsUsed,
+      posts_fetched: totalPostsFetched,
+      posts_passed: passedPostsCount,
+      candidates_created: candidatesCreated,
+      candidates_updated: candidatesUpdated,
+      gemini_calls_used: geminiCallsUsed,
+      pagination_stopped_reason: 'ERROR',
+      cursor_advanced: false,
       error: errMsg
     };
   }
 }
 
-/**
- * Runs all enabled queries or priority P1 queries
- */
 export async function runBatchQueries(filter?: 'P1' | 'ENABLED' | 'DUE'): Promise<RunQueryResult[]> {
-  const allQueries = store.getQueries();
-  const results: RunQueryResult[] = [];
-
+  const queries = store.getQueries();
   const now = Date.now();
-  const toRun = allQueries.filter(q => {
+
+  const toRun = queries.filter(q => {
     if (!q.enabled) return false;
     if (filter === 'P1') return q.priority === 'P1';
     if (filter === 'DUE') {
       if (!q.last_run_at) return true;
-      const lastRun = new Date(q.last_run_at).getTime();
-      const intervalMs = (q.run_frequency_minutes || 60) * 60 * 1000;
-      return now >= lastRun + intervalMs;
+      const elapsedMinutes = (now - new Date(q.last_run_at).getTime()) / (1000 * 60);
+      return elapsedMinutes >= (q.run_frequency_minutes || 120);
     }
-    return true; // 'ENABLED'
+    return true;
   });
 
+  const results: RunQueryResult[] = [];
   for (const q of toRun) {
-    const res = await runQuery(q.id);
-    results.push(res);
-  }
-
-  return results;
-}
-
-/**
- * Seeds and initializes the system with full mock execution and realistic human review labels
- * so that all pages (/posts, /candidates, /candidates/:id, /analytics/queries, /analytics/feedback)
- * are immediately functional and demonstrably testable!
- */
-export async function seedAndRunMockWorkflow(): Promise<void> {
-  // 1. Run all P1 & P2 queries against mock fixtures
-  const p1AndP2 = store.getQueries().filter(q => q.priority === 'P1' || q.priority === 'P2');
-  for (const q of p1AndP2) {
-    await runQuery(q.id);
-  }
-  // Run viral P3 queries to demonstrate high noise & contrast
-  const viralQueries = store.getQueries().filter(q => q.category === 'VIRAL');
-  for (const q of viralQueries) {
-    await runQuery(q.id);
-  }
-
-  // 2. Pre-seed realistic human labels for key candidates to demonstrate precision analytics
-  const candidates = store.getCandidates();
-  const now = new Date().toISOString();
-
-  for (const c of candidates) {
-    const norm = c.normalized_name;
-    let label: CandidateHumanLabel | undefined;
-    let notes: string | undefined;
-
-    if (norm.includes('frogblood')) {
-      label = 'VALUABLE_NEW_GAME';
-      notes = 'Legitimate new indie roguelike with active playable browser demo on itch.io';
-    } else if (norm.includes('pixel frog hotel')) {
-      label = 'VALUABLE_NEW_GAME';
-      notes = 'Excellent cozy browser game on Poki, genuinely new release';
-    } else if (norm.includes('tiny fishing horror')) {
-      label = 'VALUABLE_NEW_GAME';
-      notes = 'Viral Ludum Dare 48h game jam hit with HTML5 build';
-    } else if (norm.includes('dungeon office')) {
-      label = 'VALUABLE_NEW_GAME';
-      notes = 'HR comedy simulator on GitHub Pages with WebGL';
-    } else if (norm.includes('browser knight')) {
-      label = 'VALID_GAME';
-      notes = 'Clean Phaser HTML5 action game on CrazyGames';
-    } else if (norm.includes('asteroid courier')) {
-      label = 'VALUABLE_NEW_GAME';
-      notes = 'GMTK jam submission with zero-g browser mechanics';
-    } else if (norm.includes('neon drift')) {
-      label = 'VALID_GAME';
-      notes = 'PC Steam indie release, verified developer launch';
-    } else if (norm.includes('sprout witch')) {
-      label = 'VALUABLE_NEW_GAME';
-      notes = 'Browser garden potion jam game on itch';
-    } else if (norm.includes('shadow weaver')) {
-      label = 'VALID_GAME';
-      notes = 'Steam metroidvania release announcement';
-    } else if (norm.includes('slime arena')) {
-      label = 'VALID_GAME';
-      notes = 'Godot web export arena game';
-    } else if (norm.includes('void drifter')) {
-      label = 'VALUABLE_NEW_GAME';
-      notes = 'PICO-8 minimalist HTML5 dodge game';
-    } else if (norm.includes('run')) {
-      label = 'WRONG_GAME_NAME';
-      notes = 'Generic single word title without verified multiplayer or brand evidence';
-    } else if (norm.includes('battle')) {
-      label = 'NOISE';
-      notes = 'Vague single word tweet without playable link or metadata';
-    }
-
-    if (label) {
-      store.updateCandidate(c.id, {
-        human_label: label,
-        human_notes: notes,
-        labeled_at: now,
-        status: label === 'VALUABLE_NEW_GAME' || label === 'VALID_GAME' ? 'CONFIRMED' : 'REJECTED'
+    try {
+      const res = await runQuery(q.id);
+      results.push(res);
+    } catch (err: any) {
+      results.push({
+        query_id: q.id,
+        requests_used: 0,
+        posts_fetched: 0,
+        posts_passed: 0,
+        candidates_created: 0,
+        candidates_updated: 0,
+        gemini_calls_used: 0,
+        pagination_stopped_reason: 'ERROR',
+        cursor_advanced: false,
+        error: err.message
       });
     }
   }
+  return results;
+}
 
-  // Pre-seed post-level labels for sample posts
-  const posts = store.getPosts();
-  for (const p of posts) {
-    if (p.x_post_id === 'x_1001' || p.x_post_id === 'x_1004') {
-      store.updatePost(p.id, { human_post_label: 'GOOD_DISCOVERY_POST' });
-    } else if (p.x_post_id === 'x_1018') {
-      store.updatePost(p.id, { human_post_label: 'REAL_GAME_BUT_NOT_NEW' });
-    } else if (p.x_post_id === 'x_1013') {
-      store.updatePost(p.id, { human_post_label: 'JOB' });
-    } else if (p.x_post_id === 'x_1014') {
-      store.updatePost(p.id, { human_post_label: 'TUTORIAL' });
-    } else if (p.x_post_id === 'x_1015') {
-      store.updatePost(p.id, { human_post_label: 'PROMOTION_SPAM' });
-    } else if (p.x_post_id === 'x_1025') {
-      store.updatePost(p.id, { human_post_label: 'GENERAL_GAMEDEV' });
-    }
-  }
-
-  // Recalculate precision stats across all queries
-  for (const q of store.getQueries()) {
-    const queryPosts = store.getPosts().filter(p => p.query_ids.includes(q.id));
-    const passed = queryPosts.filter(p => p.hard_filter_status === 'PASSED');
-    const cands = store.getCandidates().filter(c => c.source_query_ids.includes(q.id));
-
-    const humanValid = cands.filter(
-      c => c.human_label === 'VALID_GAME' || c.human_label === 'VALUABLE_NEW_GAME'
-    ).length;
-    const humanRejected = cands.filter(
-      c =>
-        c.human_label === 'NOT_A_GAME' ||
-        c.human_label === 'OLD_GAME' ||
-        c.human_label === 'NOISE' ||
-        c.human_label === 'WRONG_GAME_NAME' ||
-        c.human_label === 'GAME_NOT_TARGET'
-    ).length;
-    const valuableNew = cands.filter(
-      c => c.human_label === 'VALUABLE_NEW_GAME'
-    ).length;
-
-    const totalReviewed = humanValid + humanRejected;
-    const precision = totalReviewed > 0 ? Math.round((humanValid / totalReviewed) * 100) : 0;
-
-    store.updateQuery(q.id, {
-      posts_collected: queryPosts.length,
-      posts_passed_filter: passed.length,
-      candidates_generated: cands.length,
-      human_validated_games: humanValid,
-      human_rejected: humanRejected,
-      valuable_new_games: valuableNew,
-      precision
-    });
+export async function seedAndRunMockWorkflow(): Promise<void> {
+  const queries = store.getQueries();
+  for (const q of queries) {
+    await runQuery(q.id);
   }
 }

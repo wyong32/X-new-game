@@ -270,6 +270,13 @@ export const CandidateList: React.FC<CandidateListProps> = ({
               <span className="w-2 h-2 rounded-full bg-indigo-400 mr-1.5" />
               Browser/H5: {candidates.filter(c => c.browser_signal).length}
             </span>
+            <a
+              href={`/api/export/candidates?auth_token=${localStorage.getItem('lab_token') || ''}`}
+              className="ml-2 text-slate-300 hover:text-white bg-slate-800 hover:bg-slate-700 border border-slate-700 px-2 py-0.5 rounded text-[10px] font-mono transition-colors"
+              title="Download CSV of all candidates"
+            >
+              Export CSV
+            </a>
           </div>
         </div>
       </div>

@@ -21,6 +21,7 @@ export const QueryAnalytics: React.FC<QueryAnalyticsProps> = ({ onSelectQueryFil
   const [data, setData] = useState<{
     summaries: QueryAnalyticsSummary[];
     leaderboard_valuable_yield: QueryAnalyticsSummary[];
+    leaderboard_first_discovery_yield?: QueryAnalyticsSummary[];
     leaderboard_precision: QueryAnalyticsSummary[];
     highest_noise: QueryAnalyticsSummary[];
   } | null>(null);
@@ -28,7 +29,10 @@ export const QueryAnalytics: React.FC<QueryAnalyticsProps> = ({ onSelectQueryFil
 
   const fetchAnalytics = async () => {
     try {
-      const res = await fetch('/api/analytics/queries');
+      const token = localStorage.getItem('lab_token');
+      const res = await fetch('/api/analytics/queries', {
+        headers: token ? { Authorization: `Bearer ${token}` } : {}
+      });
       if (res.ok) {
         const json = await res.json();
         setData(json);
@@ -86,7 +90,7 @@ export const QueryAnalytics: React.FC<QueryAnalyticsProps> = ({ onSelectQueryFil
           </div>
 
           <a
-            href="/api/export/queries"
+            href={`/api/export/queries?auth_token=${localStorage.getItem('lab_token') || ''}`}
             className="inline-flex items-center space-x-1.5 bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-medium px-3 py-1.5 rounded-md border border-slate-700 transition-colors"
           >
             <Download className="w-3.5 h-3.5 text-slate-400" />
@@ -208,10 +212,11 @@ export const QueryAnalytics: React.FC<QueryAnalyticsProps> = ({ onSelectQueryFil
                 <th className="py-2.5 px-3">Category</th>
                 <th className="py-2.5 px-3">Posts Collected</th>
                 <th className="py-2.5 px-3">Pass Rate</th>
-                <th className="py-2.5 px-3">Candidates</th>
+                <th className="py-2.5 px-3">Total Cands</th>
+                <th className="py-2.5 px-3">First Discovery</th>
                 <th className="py-2.5 px-3">Valid Game %</th>
                 <th className="py-2.5 px-3">Valuable New %</th>
-                <th className="py-2.5 px-3">Yield / 1k Posts</th>
+                <th className="py-2.5 px-3">Valuable Yield / 1k</th>
               </tr>
             </thead>
             <tbody className="divide-y divide-slate-800 font-sans">
@@ -263,10 +268,20 @@ export const QueryAnalytics: React.FC<QueryAnalyticsProps> = ({ onSelectQueryFil
                   {/* Candidates Generated & Reviewed */}
                   <td className="py-3 px-3 whitespace-nowrap font-mono">
                     <div>
-                      <strong className="text-sky-300">{s.candidates_generated}</strong> cands
+                      <strong className="text-sky-300">{s.candidates_generated}</strong>
                     </div>
                     <div className="text-[10px] text-slate-400">
                       {s.human_reviewed_candidates} reviewed
+                    </div>
+                  </td>
+
+                  {/* First Discovery Attributed (P1 Requirement 8) */}
+                  <td className="py-3 px-3 whitespace-nowrap font-mono">
+                    <div className="text-indigo-300 font-semibold">
+                      {s.first_discovery_candidates_count || 0} cands
+                    </div>
+                    <div className="text-[10px] text-emerald-400">
+                      {s.first_discovery_valuable_games || 0} valuable
                     </div>
                   </td>
 
@@ -291,14 +306,25 @@ export const QueryAnalytics: React.FC<QueryAnalyticsProps> = ({ onSelectQueryFil
                     <div className="text-sm font-bold text-emerald-400">
                       {s.yield_valuable_per_1k_posts}
                     </div>
-                    <div className="text-[10px] text-slate-500">
-                      1 game / {s.posts_per_valuable_game || '—'} posts
+                    <div className="text-[10px] text-indigo-400" title="First Discovery Valuable Yield / 1k Posts">
+                      1st disc: {s.first_discovery_valuable_yield_per_1k_posts || 0}
                     </div>
                   </td>
                 </tr>
               ))}
             </tbody>
           </table>
+        </div>
+
+        {/* Methodology Footnote (P1 Requirement 7) */}
+        <div className="bg-slate-950/60 p-3.5 border-t border-slate-800 text-[11px] text-slate-400 flex flex-col sm:flex-row items-start sm:items-center justify-between gap-2">
+          <div className="flex items-center space-x-2">
+            <span className="text-sky-400 font-bold font-mono">ℹ Methodology:</span>
+            <span>
+              <strong>Validation Precision</strong> = Valid Games / (Valid Games + Rejected Games). Candidates marked <em>UNSURE</em> or <em>DUPLICATE</em> are excluded from the denominator so exploratory ambiguity does not falsely penalize query yield.
+            </span>
+          </div>
+          <span className="font-mono text-slate-500 shrink-0">Standardized Ground-Truth Precision</span>
         </div>
       </div>
     </div>

@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import type { GameCandidate, XPost, CandidateHumanLabel, XQuery } from '../types.js';
+import type { GameCandidate, XPost, CandidateHumanLabel, XQuery, CandidateQueryEvidence } from '../types.js';
 import { formatDateTime, formatTimeAgo } from '../lib/formatters.js';
 import {
   ArrowLeft,
@@ -16,7 +16,8 @@ import {
   AlertTriangle,
   Info,
   ShieldCheck,
-  Award
+  Award,
+  Compass
 } from 'lucide-react';
 
 interface CandidateDetailProps {
@@ -34,7 +35,9 @@ export const CandidateDetail: React.FC<CandidateDetailProps> = ({
   onMergeCandidate,
   allCandidates
 }) => {
-  const [candidate, setCandidate] = useState<(GameCandidate & { posts: XPost[]; queries: XQuery[] }) | null>(null);
+  const [candidate, setCandidate] = useState<
+    (GameCandidate & { posts: XPost[]; queries: XQuery[]; evidence?: CandidateQueryEvidence[] }) | null
+  >(null);
   const [loading, setLoading] = useState(true);
   const [editingName, setEditingName] = useState(false);
   const [tempName, setTempName] = useState('');
@@ -46,7 +49,10 @@ export const CandidateDetail: React.FC<CandidateDetailProps> = ({
   const fetchDetail = async () => {
     setLoading(true);
     try {
-      const res = await fetch(`/api/candidates/${candidateId}`);
+      const token = localStorage.getItem('lab_token');
+      const res = await fetch(`/api/candidates/${candidateId}`, {
+        headers: token ? { Authorization: `Bearer ${token}` } : {}
+      });
       if (res.ok) {
         const data = await res.json();
         setCandidate(data);
@@ -345,6 +351,71 @@ export const CandidateDetail: React.FC<CandidateDetailProps> = ({
                 </div>
               </div>
             )}
+          </div>
+
+          {/* Section: Query Attribution & Discovery Evidence (P1 Requirement 8) */}
+          <div className="bg-slate-900 border border-slate-800 rounded-xl p-5 space-y-4">
+            <div className="flex items-center justify-between border-b border-slate-800 pb-3">
+              <h2 className="text-sm font-semibold text-white uppercase tracking-wider font-mono flex items-center">
+                <Compass className="w-4 h-4 mr-2 text-indigo-400" />
+                Query Attribution & Discovery Evidence
+              </h2>
+              <span className="text-[11px] text-slate-400">
+                {candidate.queries.length} contributing queries
+              </span>
+            </div>
+
+            <div className="space-y-3">
+              {candidate.queries.map(q => {
+                const isFirst = candidate.first_discovery_query_id === q.id;
+                const ev = candidate.evidence?.find(e => e.query_id === q.id);
+                return (
+                  <div
+                    key={q.id}
+                    className={`p-3 rounded-lg border text-xs space-y-1.5 transition-colors ${
+                      isFirst
+                        ? 'bg-indigo-950/30 border-indigo-500/40 text-slate-200'
+                        : 'bg-slate-800/40 border-slate-800 text-slate-300'
+                    }`}
+                  >
+                    <div className="flex items-center justify-between">
+                      <div className="flex items-center space-x-2">
+                        {isFirst && (
+                          <span className="bg-indigo-500/20 text-indigo-300 border border-indigo-500/40 px-2 py-0.5 rounded text-[10px] font-semibold uppercase tracking-wider">
+                            ★ First Discovered By
+                          </span>
+                        )}
+                        <span className="font-semibold text-white">{q.name}</span>
+                        <span className="text-slate-500 font-mono text-[10px]">({q.id})</span>
+                      </div>
+                      <div className="flex items-center space-x-2 text-[11px]">
+                        <span className="bg-slate-800 border border-slate-700 px-1.5 py-0.5 rounded text-slate-300">
+                          {q.category}
+                        </span>
+                        <span className="font-mono text-sky-400">{q.priority}</span>
+                      </div>
+                    </div>
+
+                    <div className="text-[11px] text-slate-400 font-mono bg-slate-900/60 p-1.5 rounded">
+                      {q.query_text}
+                    </div>
+
+                    <div className="flex items-center justify-between text-[11px] text-slate-400 pt-1">
+                      <span>
+                        Posts contributed:{' '}
+                        <strong className="text-white">
+                          {ev ? ev.post_count : candidate.posts.filter(p => p.query_ids.includes(q.id)).length}
+                        </strong>
+                      </span>
+                      <span>
+                        First seen:{' '}
+                        <strong>{formatDateTime(ev?.first_seen_at || candidate.first_seen_at)}</strong>
+                      </span>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
           </div>
 
           {/* Section: All Contributing Source Posts */}

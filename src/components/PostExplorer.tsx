@@ -181,6 +181,14 @@ export const PostExplorer: React.FC<PostExplorerProps> = ({
               <ImageIcon className="w-3 h-3" />
               <span>Has Media</span>
             </button>
+
+            <a
+              href={`/api/export/posts?auth_token=${localStorage.getItem('lab_token') || ''}`}
+              className="ml-2 text-slate-300 hover:text-white bg-slate-800 hover:bg-slate-700 border border-slate-700 px-2 py-0.5 rounded text-[10px] font-mono transition-colors"
+              title="Download CSV of all raw posts"
+            >
+              Export CSV
+            </a>
           </div>
         </div>
       </div>
