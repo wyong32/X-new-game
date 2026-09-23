@@ -487,6 +487,482 @@ async function runTests() {
     assert(refusedStartup === true, 'LIVE mode with missing APP_PASSWORD refuses startup');
   }
 
+  // =========================================================================
+  // 7. Pending Extraction Recovery Test
+  // =========================================================================
+  console.log('\n--- TEST 7: Pending Extraction Recovery ---');
+  {
+    const testDbPath = path.join(process.cwd(), 'data', 'test_db_p1_7.json');
+    if (fs.existsSync(testDbPath)) fs.unlinkSync(testDbPath);
+
+    const store = new MemoryStore(testDbPath);
+    await store.init();
+
+    await store.updateSettings({
+      gemini_extraction_enabled: true,
+      max_gemini_extractions_per_run: 2
+    });
+
+    const now = Date.now();
+    // 5 pending posts with different created_at (post 1 is oldest)
+    for (let i = 1; i <= 5; i++) {
+      await store.savePost({
+        id: `post_pending_${i}`,
+        x_post_id: `x_pending_${i}`,
+        text: `Playing indie game SolarClash_${i} demo today! Itch: https://solarclash.itch.io/game-${i}`,
+        author_id: `author_${i}`,
+        author_username: `gamer_${i}`,
+        created_at: new Date(now - (10 - i) * 60000).toISOString(),
+        fetched_at: new Date().toISOString(),
+        like_count: 5,
+        reply_count: 0,
+        repost_count: 0,
+        quote_count: 0,
+        urls: [`https://solarclash.itch.io/game-${i}`],
+        hashtags: ['indiegames'],
+        has_media: false,
+        media_types: [],
+        query_ids: ['q_test_pending'],
+        hard_filter_status: 'PASSED',
+        hard_filter_reasons: [],
+        game_context_score: 75,
+        game_context_positive_reasons: ['Game release language', 'Valid link'],
+        game_context_negative_reasons: [],
+        extraction_status: 'PENDING_EXTRACTION',
+        candidate_processed: false,
+        created_at_db: new Date(now - (10 - i) * 60000).toISOString(),
+        updated_at: new Date().toISOString()
+      });
+    }
+
+    const mockExtractor = async (text: string) => {
+      const match = text.match(/SolarClash_(\d+)/);
+      const num = match ? match[1] : 'Game';
+      return {
+        is_specific_game: true,
+        game_name: `Solar Clash ${num}`,
+        confidence: 0.92
+      };
+    };
+
+    await store.saveQuery({
+      id: 'q_test_pending',
+      name: 'Test Pending Query',
+      query_text: 'SolarClash',
+      category: 'RELEASE',
+      priority: 'P1',
+      initial_confidence: 0.8,
+      enabled: false,
+      run_frequency_minutes: 60,
+      posts_collected: 5,
+      posts_passed_filter: 5,
+      candidates_generated: 0,
+      human_validated_games: 0,
+      human_rejected: 0,
+      valuable_new_games: 0,
+      precision: 0,
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString()
+    });
+
+    // Batch #1: Gemini budget = 2 -> 2 processed, 3 remain pending
+    const batch1 = await runBatchQueries('P1', {
+      store,
+      geminiExtractor: mockExtractor,
+      budget: {
+        requestsRemaining: 10,
+        postsRemaining: 100,
+        geminiRemaining: 2,
+        initialRequests: 10,
+        initialPosts: 100,
+        initialGemini: 2
+      }
+    });
+
+    assert(batch1.pending_recovery?.processed === 2, `Batch #1: 2 processed (got ${batch1.pending_recovery?.processed})`);
+    assert(batch1.pending_recovery?.remained_pending === 3, `Batch #1: 3 remain pending (got ${batch1.pending_recovery?.remained_pending})`);
+
+    const p1 = await store.getPost('post_pending_1');
+    const p2 = await store.getPost('post_pending_2');
+    const p3 = await store.getPost('post_pending_3');
+    assert(p1?.extraction_status === 'COMPLETED' && p1.extracted_game_name === 'Solar Clash 1', 'Oldest post 1 processed in Batch 1');
+    assert(p2?.extraction_status === 'COMPLETED' && p2.extracted_game_name === 'Solar Clash 2', 'Oldest post 2 processed in Batch 1');
+    assert(p3?.extraction_status === 'PENDING_EXTRACTION', 'Post 3 remains pending after Batch 1');
+
+    // Batch #2: Gemini budget = 2 -> 2 processed, 1 remains pending
+    const batch2 = await runBatchQueries('P1', {
+      store,
+      geminiExtractor: mockExtractor,
+      budget: {
+        requestsRemaining: 10,
+        postsRemaining: 100,
+        geminiRemaining: 2,
+        initialRequests: 10,
+        initialPosts: 100,
+        initialGemini: 2
+      }
+    });
+
+    assert(batch2.pending_recovery?.processed === 2, `Batch #2: 2 processed (got ${batch2.pending_recovery?.processed})`);
+    assert(batch2.pending_recovery?.remained_pending === 1, `Batch #2: 1 remains pending (got ${batch2.pending_recovery?.remained_pending})`);
+
+    // Batch #3: Gemini budget = 2 -> 1 processed, 0 remain pending
+    const batch3 = await runBatchQueries('P1', {
+      store,
+      geminiExtractor: mockExtractor,
+      budget: {
+        requestsRemaining: 10,
+        postsRemaining: 100,
+        geminiRemaining: 2,
+        initialRequests: 10,
+        initialPosts: 100,
+        initialGemini: 2
+      }
+    });
+
+    assert(batch3.pending_recovery?.processed === 1, `Batch #3: 1 processed (got ${batch3.pending_recovery?.processed})`);
+    assert(batch3.pending_recovery?.remained_pending === 0, `Batch #3: 0 remain pending (got ${batch3.pending_recovery?.remained_pending})`);
+  }
+
+  // =========================================================================
+  // 8. Strict Global Post Budget Boundary Tests (remaining = 9, 5, 1)
+  // =========================================================================
+  console.log('\n--- TEST 8: Strict Global Post Budget Boundary Tests ---');
+  {
+    const testDbPath = path.join(process.cwd(), 'data', 'test_db_p1_8.json');
+    if (fs.existsSync(testDbPath)) fs.unlinkSync(testDbPath);
+
+    const store = new MemoryStore(testDbPath);
+    await store.init();
+
+    await store.saveQuery({
+      id: 'q_boundary_test',
+      name: 'Boundary Test Query',
+      query_text: 'boundary test',
+      category: 'RELEASE',
+      priority: 'P1',
+      initial_confidence: 0.8,
+      enabled: true,
+      run_frequency_minutes: 60,
+      posts_collected: 0,
+      posts_passed_filter: 0,
+      candidates_generated: 0,
+      human_validated_games: 0,
+      human_rejected: 0,
+      valuable_new_games: 0,
+      precision: 0,
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString()
+    });
+
+    let searchCalls = 0;
+    const boundaryClient = {
+      async searchRecent() {
+        searchCalls++;
+        return { data: [], meta: { result_count: 0 } };
+      }
+    };
+
+    // Test remaining = 9 -> zero additional X requests
+    searchCalls = 0;
+    const res9 = await runQuery('q_boundary_test', {
+      store,
+      customClient: boundaryClient as any,
+      budget: {
+        requestsRemaining: 10,
+        postsRemaining: 9,
+        geminiRemaining: 10,
+        initialRequests: 10,
+        initialPosts: 10,
+        initialGemini: 10
+      }
+    });
+    assert(searchCalls === 0, 'Remaining = 9: Zero additional X requests made');
+    assert(res9.pagination_stopped_reason === 'MAX_POSTS_REACHED', 'Remaining = 9: Stopped with MAX_POSTS_REACHED');
+
+    // Test remaining = 5 -> zero additional X requests
+    searchCalls = 0;
+    const res5 = await runQuery('q_boundary_test', {
+      store,
+      customClient: boundaryClient as any,
+      budget: {
+        requestsRemaining: 10,
+        postsRemaining: 5,
+        geminiRemaining: 10,
+        initialRequests: 10,
+        initialPosts: 10,
+        initialGemini: 10
+      }
+    });
+    assert(searchCalls === 0, 'Remaining = 5: Zero additional X requests made');
+    assert(res5.pagination_stopped_reason === 'MAX_POSTS_REACHED', 'Remaining = 5: Stopped with MAX_POSTS_REACHED');
+
+    // Test remaining = 1 -> zero additional X requests
+    searchCalls = 0;
+    const res1 = await runQuery('q_boundary_test', {
+      store,
+      customClient: boundaryClient as any,
+      budget: {
+        requestsRemaining: 10,
+        postsRemaining: 1,
+        geminiRemaining: 10,
+        initialRequests: 10,
+        initialPosts: 10,
+        initialGemini: 10
+      }
+    });
+    assert(searchCalls === 0, 'Remaining = 1: Zero additional X requests made');
+    assert(res1.pagination_stopped_reason === 'MAX_POSTS_REACHED', 'Remaining = 1: Stopped with MAX_POSTS_REACHED');
+
+    // Test in runBatchQueries with postsRemaining = 9
+    searchCalls = 0;
+    const batchBoundary = await runBatchQueries('P1', {
+      store,
+      customClient: boundaryClient as any,
+      budget: {
+        requestsRemaining: 10,
+        postsRemaining: 9,
+        geminiRemaining: 10,
+        initialRequests: 10,
+        initialPosts: 10,
+        initialGemini: 10
+      }
+    });
+    assert(searchCalls === 0, 'Batch with remaining = 9: Zero additional X requests made');
+    assert(batchBoundary.budget_usage.stopped_early_reason === 'GLOBAL_POSTS_BUDGET_EXHAUSTED', 'Batch stopped with GLOBAL_POSTS_BUDGET_EXHAUSTED');
+    assert(batchBoundary.budget_usage.posts_remaining === 9, 'posts_remaining never negative (got 9)');
+  }
+
+  // =========================================================================
+  // 9. Fair Query Scheduling Test
+  // =========================================================================
+  console.log('\n--- TEST 9: Fair Query Scheduling ---');
+  {
+    const testDbPath = path.join(process.cwd(), 'data', 'test_db_p1_9.json');
+    if (fs.existsSync(testDbPath)) fs.unlinkSync(testDbPath);
+
+    const store = new MemoryStore(testDbPath);
+    await store.init();
+
+    await store.updateSettings({
+      max_x_requests_per_run: 2,
+      max_x_posts_per_run: 200,
+      gemini_extraction_enabled: false
+    });
+
+    // Disable pre-seeded queries so only the test queries are evaluated
+    const preExisting = await store.getQueries();
+    for (const pq of preExisting) {
+      await store.updateQuery(pq.id, { enabled: false });
+    }
+
+    const executedQueryIds = new Set<string>();
+    for (let i = 1; i <= 5; i++) {
+      await store.saveQuery({
+        id: `q_fair_${i}`,
+        name: `Fair Query ${i}`,
+        query_text: `fair query ${i}`,
+        category: 'RELEASE',
+        priority: 'P1',
+        initial_confidence: 0.8,
+        enabled: true,
+        run_frequency_minutes: 60,
+        posts_collected: 0,
+        posts_passed_filter: 0,
+        candidates_generated: 0,
+        human_validated_games: 0,
+        human_rejected: 0,
+        valuable_new_games: 0,
+        precision: 0,
+        created_at: new Date().toISOString(),
+        updated_at: new Date().toISOString()
+      });
+    }
+
+    const dummyClient = {
+      async searchRecent() {
+        return { data: [], meta: { result_count: 0 } };
+      }
+    };
+
+    // Run batch 1 (budget allows 2 requests)
+    const b1 = await runBatchQueries('P1', {
+      store,
+      customClient: dummyClient as any,
+      budget: {
+        requestsRemaining: 2,
+        postsRemaining: 100,
+        geminiRemaining: 0,
+        initialRequests: 2,
+        initialPosts: 100,
+        initialGemini: 0
+      }
+    });
+    b1.results.forEach(r => executedQueryIds.add(r.query_id));
+    assert(b1.results.length === 2, `Batch 1 executed 2 queries (got ${b1.results.length})`);
+
+    // Run batch 2 (budget allows 2 requests)
+    const b2 = await runBatchQueries('P1', {
+      store,
+      customClient: dummyClient as any,
+      budget: {
+        requestsRemaining: 2,
+        postsRemaining: 100,
+        geminiRemaining: 0,
+        initialRequests: 2,
+        initialPosts: 100,
+        initialGemini: 0
+      }
+    });
+    b2.results.forEach(r => executedQueryIds.add(r.query_id));
+    assert(b2.results.length === 2, `Batch 2 executed 2 queries (got ${b2.results.length})`);
+
+    // Run batch 3 (budget allows 2 requests)
+    const b3 = await runBatchQueries('P1', {
+      store,
+      customClient: dummyClient as any,
+      budget: {
+        requestsRemaining: 2,
+        postsRemaining: 100,
+        geminiRemaining: 0,
+        initialRequests: 2,
+        initialPosts: 100,
+        initialGemini: 0
+      }
+    });
+    b3.results.forEach(r => executedQueryIds.add(r.query_id));
+
+    // Verify all 5 queries were given execution opportunities!
+    for (let i = 1; i <= 5; i++) {
+      assert(executedQueryIds.has(`q_fair_${i}`), `Query q_fair_${i} was executed across budget-limited batches`);
+    }
+    assert(executedQueryIds.size === 5, 'All 5 enabled queries received execution opportunities without starvation');
+  }
+
+  // =========================================================================
+  // 10. Pagination Stress Test (250 fake posts, max 100 per run)
+  // =========================================================================
+  console.log('\n--- TEST 10: Pagination Stress Test (250 Posts, 100/Run) ---');
+  {
+    const testDbPath = path.join(process.cwd(), 'data', 'test_db_p1_10.json');
+    if (fs.existsSync(testDbPath)) fs.unlinkSync(testDbPath);
+
+    const store = new MemoryStore(testDbPath);
+    await store.init();
+
+    await store.updateSettings({
+      gemini_extraction_enabled: false
+    });
+
+    const totalPosts = 250;
+    const customPosts: XSearchResultItem[] = Array.from({ length: totalPosts }, (_, i) => ({
+      id: String(8000000000000000000n + BigInt(totalPosts - i)), // descending IDs: newest first
+      text: `Stress test game announcement #${i}: Play RetroRealm-${i} now at https://itch.io/retrorealm-${i}`,
+      author_id: `dev_${i}`,
+      author_username: `author_${i}`,
+      created_at: new Date(Date.now() - i * 60000).toISOString(),
+      public_metrics: { like_count: 5, reply_count: 1, retweet_count: 1, quote_count: 0 },
+      entities: {
+        urls: [{ url: `https://itch.io/retrorealm-${i}`, expanded_url: `https://itch.io/retrorealm-${i}` }]
+      }
+    }));
+
+    const stressClient = {
+      async searchRecent(params: any) {
+        const pageSize = params.maxResults || 100;
+        let startIndex = 0;
+        if (params.nextToken && params.nextToken.startsWith('stress_token_')) {
+          startIndex = parseInt(params.nextToken.replace('stress_token_', ''), 10) || 0;
+        }
+        const paged = customPosts.slice(startIndex, startIndex + pageSize);
+        const nextOffset = startIndex + pageSize;
+        const hasMore = nextOffset < customPosts.length;
+        return {
+          data: paged,
+          meta: {
+            result_count: paged.length,
+            newest_id: paged.length > 0 ? paged[0].id : undefined,
+            oldest_id: paged.length > 0 ? paged[paged.length - 1].id : undefined,
+            next_token: hasMore ? `stress_token_${nextOffset}` : undefined
+          }
+        };
+      }
+    };
+
+    const initialSinceId = '1000000000000000000';
+    await store.saveQuery({
+      id: 'q_stress_pagination',
+      name: 'Stress Pagination Query',
+      query_text: 'RetroRealm',
+      category: 'RELEASE',
+      priority: 'P1',
+      initial_confidence: 0.8,
+      enabled: true,
+      last_since_id: initialSinceId,
+      run_frequency_minutes: 60,
+      posts_collected: 0,
+      posts_passed_filter: 0,
+      candidates_generated: 0,
+      human_validated_games: 0,
+      human_rejected: 0,
+      valuable_new_games: 0,
+      precision: 0,
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString()
+    });
+
+    // Run #1: Max posts = 100
+    const res1 = await runQuery('q_stress_pagination', {
+      store,
+      customClient: stressClient as any,
+      maxPostsOverride: 100
+    });
+
+    const qAfter1 = await store.getQuery('q_stress_pagination');
+    const postsAfter1 = await store.getPosts();
+    assert(res1.posts_fetched === 100, `Run #1: 100 posts fetched (got ${res1.posts_fetched})`);
+    assert(postsAfter1.length === 100, `Run #1: 100 persisted (got ${postsAfter1.length})`);
+    assert(Boolean(qAfter1?.pending_next_token), `Run #1: pending pagination exists (${qAfter1?.pending_next_token})`);
+    assert(qAfter1?.last_since_id === initialSinceId, `Run #1: last_since_id NOT advanced (${qAfter1?.last_since_id})`);
+
+    // Run #2: Max posts = 100
+    const res2 = await runQuery('q_stress_pagination', {
+      store,
+      customClient: stressClient as any,
+      maxPostsOverride: 100
+    });
+
+    const qAfter2 = await store.getQuery('q_stress_pagination');
+    const postsAfter2 = await store.getPosts();
+    assert(res2.posts_fetched === 100, `Run #2: 100 posts fetched (got ${res2.posts_fetched})`);
+    assert(postsAfter2.length === 200, `Run #2: 200 total unique persisted (got ${postsAfter2.length})`);
+    assert(Boolean(qAfter2?.pending_next_token), `Run #2: pending pagination exists (${qAfter2?.pending_next_token})`);
+    assert(qAfter2?.last_since_id === initialSinceId, `Run #2: last_since_id NOT advanced (${qAfter2?.last_since_id})`);
+
+    // Run #3: Max posts = 100 (fetches remaining 50)
+    const res3 = await runQuery('q_stress_pagination', {
+      store,
+      customClient: stressClient as any,
+      maxPostsOverride: 100
+    });
+
+    const qAfter3 = await store.getQuery('q_stress_pagination');
+    const postsAfter3 = await store.getPosts();
+    assert(res3.posts_fetched === 50, `Run #3: 50 posts fetched (got ${res3.posts_fetched})`);
+    assert(postsAfter3.length === 250, `Run #3: 250 total unique persisted (got ${postsAfter3.length})`);
+    assert(res3.pagination_stopped_reason === 'EXHAUSTED', `Run #3: stopped with EXHAUSTED (got ${res3.pagination_stopped_reason})`);
+    assert(qAfter3?.pending_next_token === undefined, `Run #3: pagination cleared`);
+    assert(qAfter3?.last_since_id === customPosts[0].id, `Run #3: last_since_id advanced to newest post (${qAfter3?.last_since_id})`);
+
+    // Verification: 0 duplicates, 0 skipped posts
+    const storedIds = postsAfter3.map(p => p.x_post_id);
+    const uniqueIds = new Set(storedIds);
+    assert(uniqueIds.size === 250, `0 duplicates (unique IDs = ${uniqueIds.size} / 250)`);
+
+    const allPresent = customPosts.every(cp => uniqueIds.has(cp.id));
+    assert(allPresent, `0 skipped posts (all 250 customPosts verified in store)`);
+  }
+
   console.log('\n🎉 ALL P1 INTEGRATION TESTS PASSED SUCCESSFULLY!\n');
 }
 

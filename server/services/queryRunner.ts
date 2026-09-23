@@ -49,6 +49,294 @@ export type GeminiExtractorFn = (
   confidence?: number;
 } | null>;
 
+export async function createOrMergeCandidateForPost(
+  post: XPost,
+  queryId: string,
+  currentStore: Store
+): Promise<{ created: boolean; updated: boolean }> {
+  if (!post.extracted_game_name) {
+    return { created: false, updated: false };
+  }
+
+  const canonicalName = cleanCanonicalTitle(post.extracted_game_name);
+  const normName = normalizeGameName(canonicalName);
+  const now = new Date().toISOString();
+
+  // Find existing candidate to cluster with
+  const allCandidates = await currentStore.getCandidates();
+  const existingCandidate = allCandidates.find(c =>
+    shouldMergeCandidates(
+      {
+        canonical_name: canonicalName,
+        normalized_name: normName,
+        aliases: [],
+        urls: post?.urls || []
+      },
+      {
+        canonical_name: c.canonical_name,
+        normalized_name: c.normalized_name,
+        aliases: c.aliases,
+        urls: c.urls
+      }
+    )
+  );
+
+  if (existingCandidate) {
+    // Update existing candidate
+    if (!existingCandidate.source_post_ids.includes(post.id)) {
+      existingCandidate.source_post_ids.push(post.id);
+    }
+    if (!existingCandidate.source_query_ids.includes(queryId)) {
+      existingCandidate.source_query_ids.push(queryId);
+    }
+    for (const u of post.urls) {
+      if (!existingCandidate.urls.includes(u)) {
+        existingCandidate.urls.push(u);
+      }
+    }
+
+    // Attribution requirement: do NOT overwrite first_discovery_query_id!
+    if (!existingCandidate.first_discovery_query_id) {
+      existingCandidate.first_discovery_query_id = existingCandidate.first_query_id || queryId;
+    }
+
+    // Recalculate candidate metrics
+    const candidatePosts: XPost[] = (
+      await Promise.all(existingCandidate.source_post_ids.map(pid => currentStore.getPost(pid)))
+    ).filter((p): p is XPost => Boolean(p));
+
+    const isBrowser =
+      candidatePosts.some(p => p.game_context_positive_reasons.some(r => r.includes('Browser/web'))) ||
+      existingCandidate.urls.some(u => /(?:poki|crazygames|html5|webgl)/i.test(u));
+
+    const scored = computeCandidateScore({
+      canonical_name: existingCandidate.canonical_name,
+      normalized_name: existingCandidate.normalized_name,
+      posts: candidatePosts,
+      extraction_method: existingCandidate.extraction_method,
+      browser_signal: isBrowser
+    });
+
+    existingCandidate.candidate_score = scored.candidate_score;
+    existingCandidate.entity_confidence = scored.entity_confidence;
+    existingCandidate.browser_confidence = scored.browser_confidence;
+    existingCandidate.browser_signal = isBrowser;
+    existingCandidate.score_breakdown = scored.score_breakdown;
+    existingCandidate.why_selected = scored.why_selected;
+    existingCandidate.unique_post_count = candidatePosts.length;
+    existingCandidate.unique_author_count = new Set(candidatePosts.map(p => p.author_id)).size;
+    existingCandidate.max_engagement = Math.max(
+      ...candidatePosts.map(p => p.like_count + p.repost_count),
+      0
+    );
+    existingCandidate.last_seen_at = post.created_at;
+
+    if (!existingCandidate.human_label && existingCandidate.status !== 'DUPLICATE') {
+      existingCandidate.status = determineCandidateStatus(scored.candidate_score);
+    }
+
+    await currentStore.saveCandidate(existingCandidate);
+    post.candidate_id = existingCandidate.id;
+    post.candidate_processed = true;
+    await currentStore.savePost(post);
+
+    // Update or create CandidateQueryEvidence for this query
+    const evidenceKey = `${existingCandidate.id}__${queryId}`;
+    const existingEvidence = await currentStore.getCandidateQueryEvidence(evidenceKey);
+    const postsForThisQuery = candidatePosts.filter(p => p.query_ids.includes(queryId));
+
+    const updatedEvidence: CandidateQueryEvidence = {
+      id: evidenceKey,
+      candidate_id: existingCandidate.id,
+      query_id: queryId,
+      first_seen_at: existingEvidence ? existingEvidence.first_seen_at : post.created_at,
+      post_count: Math.max(1, postsForThisQuery.length),
+      unique_author_count: Math.max(1, new Set(postsForThisQuery.map(p => p.author_id)).size),
+      is_first_discovery: existingCandidate.first_discovery_query_id === queryId,
+      created_at: existingEvidence ? existingEvidence.created_at : now,
+      updated_at: now
+    };
+    await currentStore.saveCandidateQueryEvidence(updatedEvidence);
+
+    return { created: false, updated: true };
+  } else {
+    // Create new Candidate entity
+    const candId = `cand_${normName.replace(/[^a-z0-9]/g, '_')}_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`;
+    const isBrowser =
+      post.game_context_positive_reasons.some(r => r.includes('Browser/web')) ||
+      post.urls.some(u => /(?:poki|crazygames|html5|webgl)/i.test(u));
+
+    const scored = computeCandidateScore({
+      canonical_name: canonicalName,
+      normalized_name: normName,
+      posts: [post],
+      extraction_method: post.extraction_method || 'HEURISTIC',
+      browser_signal: isBrowser
+    });
+
+    const newCandidate: GameCandidate = {
+      id: candId,
+      canonical_name: canonicalName,
+      normalized_name: normName,
+      aliases: [],
+      first_seen_at: post.created_at,
+      last_seen_at: post.created_at,
+      first_query_id: queryId,
+      first_discovery_query_id: queryId, // P0 query attribution
+      source_post_ids: [post.id],
+      source_query_ids: [queryId],
+      unique_post_count: 1,
+      unique_author_count: 1,
+      max_engagement: post.like_count + post.repost_count,
+      browser_signal: isBrowser,
+      browser_confidence: scored.browser_confidence,
+      entity_confidence: scored.entity_confidence,
+      candidate_score: scored.candidate_score,
+      status: determineCandidateStatus(scored.candidate_score),
+      extraction_method: post.extraction_method || 'HEURISTIC',
+      score_breakdown: scored.score_breakdown,
+      why_selected: scored.why_selected,
+      urls: [...post.urls],
+      created_at: now,
+      updated_at: now
+    };
+
+    await currentStore.saveCandidate(newCandidate);
+    post.candidate_id = candId;
+    post.candidate_processed = true;
+    await currentStore.savePost(post);
+
+    // Create initial CandidateQueryEvidence
+    const evidenceKey = `${candId}__${queryId}`;
+    const evidence: CandidateQueryEvidence = {
+      id: evidenceKey,
+      candidate_id: candId,
+      query_id: queryId,
+      first_seen_at: post.created_at,
+      post_count: 1,
+      unique_author_count: 1,
+      is_first_discovery: true,
+      created_at: now,
+      updated_at: now
+    };
+    await currentStore.saveCandidateQueryEvidence(evidence);
+
+    return { created: true, updated: false };
+  }
+}
+
+export interface ProcessPendingExtractionsOptions {
+  store?: Store;
+  budget?: RunBudget;
+  geminiExtractor?: GeminiExtractorFn;
+}
+
+export interface ProcessPendingExtractionsResult {
+  processed: number;
+  remained_pending: number;
+  candidates_created: number;
+  candidates_updated: number;
+  gemini_calls_used: number;
+}
+
+/**
+ * Recovers posts marked PENDING_EXTRACTION at the start of a batch execution.
+ * Prioritizes oldest pending posts before new posts consume the shared Gemini RunBudget.
+ */
+export async function processPendingExtractions(
+  options: ProcessPendingExtractionsOptions = {}
+): Promise<ProcessPendingExtractionsResult> {
+  const currentStore = options.store || defaultStore;
+  const settings = await currentStore.getSettings();
+
+  // If Gemini is disabled, leave pending posts untouched and do 0 calls
+  if (!settings.gemini_extraction_enabled) {
+    const allPending = (await currentStore.getPosts()).filter(
+      p => p.extraction_status === 'PENDING_EXTRACTION'
+    );
+    return {
+      processed: 0,
+      remained_pending: allPending.length,
+      candidates_created: 0,
+      candidates_updated: 0,
+      gemini_calls_used: 0
+    };
+  }
+
+  // Load oldest PENDING_EXTRACTION posts
+  const allPosts = await currentStore.getPosts();
+  const pendingPosts = allPosts.filter(p => p.extraction_status === 'PENDING_EXTRACTION');
+
+  // Sort oldest first (by created_at or created_at_db)
+  pendingPosts.sort((a, b) => {
+    const timeA = new Date(a.created_at || a.created_at_db || 0).getTime();
+    const timeB = new Date(b.created_at || b.created_at_db || 0).getTime();
+    return timeA - timeB;
+  });
+
+  let processed = 0;
+  let candidatesCreated = 0;
+  let candidatesUpdated = 0;
+  let geminiCallsUsed = 0;
+  const extractor = options.geminiExtractor || extractGameWithGemini;
+
+  for (const post of pendingPosts) {
+    // If Gemini budget runs out, leave remaining posts PENDING_EXTRACTION
+    if (options.budget && options.budget.geminiRemaining <= 0) {
+      break;
+    }
+
+    if (options.budget) {
+      options.budget.geminiRemaining--;
+    }
+    geminiCallsUsed++;
+
+    try {
+      const geminiRes = await extractor(post.text, post.urls);
+      if (geminiRes && geminiRes.is_specific_game && geminiRes.game_name) {
+        post.extracted_game_name = geminiRes.game_name;
+        post.extraction_method = 'GEMINI';
+        post.extraction_confidence = geminiRes.confidence || 0.85;
+        post.extraction_status = 'COMPLETED';
+        post.updated_at = new Date().toISOString();
+        await currentStore.savePost(post);
+
+        // Run normal candidate creation/merge pipeline if qualified
+        if (post.hard_filter_status === 'PASSED' && post.game_context_score >= 50) {
+          const qId = post.query_ids && post.query_ids.length > 0 ? post.query_ids[0] : 'recovery';
+          const candRes = await createOrMergeCandidateForPost(post, qId, currentStore);
+          if (candRes.created) candidatesCreated++;
+          if (candRes.updated) candidatesUpdated++;
+        }
+      } else {
+        // If Gemini still cannot identify a game: mark COMPLETED with no candidate (or NO_ENTITY)
+        post.extraction_status = 'COMPLETED';
+        post.extraction_method = 'GEMINI';
+        post.extraction_confidence = 0.0;
+        post.updated_at = new Date().toISOString();
+        await currentStore.savePost(post);
+      }
+      processed++;
+    } catch (err) {
+      console.error('Gemini recovery extraction error:', err);
+      // Leave post PENDING_EXTRACTION so it can be retried on next batch
+    }
+  }
+
+  const updatedPosts = await currentStore.getPosts();
+  const remainedPending = updatedPosts.filter(
+    p => p.extraction_status === 'PENDING_EXTRACTION'
+  ).length;
+
+  return {
+    processed,
+    remained_pending: remainedPending,
+    candidates_created: candidatesCreated,
+    candidates_updated: candidatesUpdated,
+    gemini_calls_used: geminiCallsUsed
+  };
+}
+
 export interface RunQueryOptions {
   customClient?: XSearchClient;
   maxRequestsOverride?: number;
@@ -117,12 +405,20 @@ export async function runQuery(
         break;
       }
 
+      // STRICT GLOBAL POST BUDGET:
+      // If postsRemaining < 10, do NOT make another X request.
+      // Stop cleanly with MAX_POSTS_REACHED. Global postsRemaining must never become negative.
+      if (options.budget && options.budget.postsRemaining < 10) {
+        stoppedReason = 'MAX_POSTS_REACHED';
+        break;
+      }
+
       // Global and query post limits
       const postsLeft = Math.min(
         maxPostsLimit - totalPostsFetched,
         options.budget ? options.budget.postsRemaining : Infinity
       );
-      if (postsLeft <= 0) {
+      if (postsLeft < 10) {
         stoppedReason = 'MAX_POSTS_REACHED';
         break;
       }
@@ -151,9 +447,10 @@ export async function runQuery(
         paginationNewestId = searchRes.meta.newest_id;
       }
 
-      totalPostsFetched += searchRes.data.length;
+      const fetchedCount = searchRes.data.length;
+      totalPostsFetched += fetchedCount;
       if (options.budget) {
-        options.budget.postsRemaining -= searchRes.data.length;
+        options.budget.postsRemaining = Math.max(0, options.budget.postsRemaining - fetchedCount);
       }
       rawBatchItems.push(...searchRes.data);
 
@@ -347,168 +644,9 @@ export async function runQuery(
         post.game_context_score >= 50 &&
         post.extracted_game_name
       ) {
-        const canonicalName = cleanCanonicalTitle(post.extracted_game_name);
-        const normName = normalizeGameName(canonicalName);
-
-        // Find existing candidate to cluster with
-        const allCandidates = await currentStore.getCandidates();
-        const existingCandidate = allCandidates.find(c =>
-          shouldMergeCandidates(
-            {
-              canonical_name: canonicalName,
-              normalized_name: normName,
-              aliases: [],
-              urls: post?.urls || []
-            },
-            {
-              canonical_name: c.canonical_name,
-              normalized_name: c.normalized_name,
-              aliases: c.aliases,
-              urls: c.urls
-            }
-          )
-        );
-
-        if (existingCandidate) {
-          // Update existing candidate
-          if (!existingCandidate.source_post_ids.includes(post.id)) {
-            existingCandidate.source_post_ids.push(post.id);
-          }
-          if (!existingCandidate.source_query_ids.includes(query.id)) {
-            existingCandidate.source_query_ids.push(query.id);
-          }
-          for (const u of post.urls) {
-            if (!existingCandidate.urls.includes(u)) {
-              existingCandidate.urls.push(u);
-            }
-          }
-
-          // Attribution requirement: do NOT overwrite first_discovery_query_id!
-          if (!existingCandidate.first_discovery_query_id) {
-            existingCandidate.first_discovery_query_id = existingCandidate.first_query_id || query.id;
-          }
-
-          // Recalculate candidate metrics
-          const candidatePosts: XPost[] = (
-            await Promise.all(existingCandidate.source_post_ids.map(pid => currentStore.getPost(pid)))
-          ).filter((p): p is XPost => Boolean(p));
-
-          const isBrowser =
-            candidatePosts.some(p => p.game_context_positive_reasons.some(r => r.includes('Browser/web'))) ||
-            existingCandidate.urls.some(u => /(?:poki|crazygames|html5|webgl)/i.test(u));
-
-          const scored = computeCandidateScore({
-            canonical_name: existingCandidate.canonical_name,
-            normalized_name: existingCandidate.normalized_name,
-            posts: candidatePosts,
-            extraction_method: existingCandidate.extraction_method,
-            browser_signal: isBrowser
-          });
-
-          existingCandidate.candidate_score = scored.candidate_score;
-          existingCandidate.entity_confidence = scored.entity_confidence;
-          existingCandidate.browser_confidence = scored.browser_confidence;
-          existingCandidate.browser_signal = isBrowser;
-          existingCandidate.score_breakdown = scored.score_breakdown;
-          existingCandidate.why_selected = scored.why_selected;
-          existingCandidate.unique_post_count = candidatePosts.length;
-          existingCandidate.unique_author_count = new Set(candidatePosts.map(p => p.author_id)).size;
-          existingCandidate.max_engagement = Math.max(
-            ...candidatePosts.map(p => p.like_count + p.repost_count),
-            0
-          );
-          existingCandidate.last_seen_at = post.created_at;
-
-          if (!existingCandidate.human_label && existingCandidate.status !== 'DUPLICATE') {
-            existingCandidate.status = determineCandidateStatus(scored.candidate_score);
-          }
-
-          await currentStore.saveCandidate(existingCandidate);
-          post.candidate_id = existingCandidate.id;
-          post.candidate_processed = true;
-          await currentStore.savePost(post);
-          candidatesUpdated++;
-
-          // Update or create CandidateQueryEvidence for this query
-          const evidenceKey = `${existingCandidate.id}__${query.id}`;
-          const existingEvidence = await currentStore.getCandidateQueryEvidence(evidenceKey);
-          const postsForThisQuery = candidatePosts.filter(p => p.query_ids.includes(query.id));
-
-          const updatedEvidence: CandidateQueryEvidence = {
-            id: evidenceKey,
-            candidate_id: existingCandidate.id,
-            query_id: query.id,
-            first_seen_at: existingEvidence ? existingEvidence.first_seen_at : post.created_at,
-            post_count: postsForThisQuery.length,
-            unique_author_count: new Set(postsForThisQuery.map(p => p.author_id)).size,
-            is_first_discovery: existingCandidate.first_discovery_query_id === query.id,
-            created_at: existingEvidence ? existingEvidence.created_at : now,
-            updated_at: now
-          };
-          await currentStore.saveCandidateQueryEvidence(updatedEvidence);
-        } else {
-          // Create new Candidate entity
-          const candId = `cand_${normName.replace(/[^a-z0-9]/g, '_')}_${Date.now()}`;
-          const isBrowser =
-            post.game_context_positive_reasons.some(r => r.includes('Browser/web')) ||
-            post.urls.some(u => /(?:poki|crazygames|html5|webgl)/i.test(u));
-
-          const scored = computeCandidateScore({
-            canonical_name: canonicalName,
-            normalized_name: normName,
-            posts: [post],
-            extraction_method: post.extraction_method || 'HEURISTIC',
-            browser_signal: isBrowser
-          });
-
-          const newCandidate: GameCandidate = {
-            id: candId,
-            canonical_name: canonicalName,
-            normalized_name: normName,
-            aliases: [],
-            first_seen_at: post.created_at,
-            last_seen_at: post.created_at,
-            first_query_id: query.id,
-            first_discovery_query_id: query.id, // P0 query attribution
-            source_post_ids: [post.id],
-            source_query_ids: [query.id],
-            unique_post_count: 1,
-            unique_author_count: 1,
-            max_engagement: post.like_count + post.repost_count,
-            browser_signal: isBrowser,
-            browser_confidence: scored.browser_confidence,
-            entity_confidence: scored.entity_confidence,
-            candidate_score: scored.candidate_score,
-            status: determineCandidateStatus(scored.candidate_score),
-            extraction_method: post.extraction_method || 'HEURISTIC',
-            score_breakdown: scored.score_breakdown,
-            why_selected: scored.why_selected,
-            urls: [...post.urls],
-            created_at: now,
-            updated_at: now
-          };
-
-          await currentStore.saveCandidate(newCandidate);
-          post.candidate_id = candId;
-          post.candidate_processed = true;
-          await currentStore.savePost(post);
-          candidatesCreated++;
-
-          // Create initial CandidateQueryEvidence
-          const evidenceKey = `${candId}__${query.id}`;
-          const evidence: CandidateQueryEvidence = {
-            id: evidenceKey,
-            candidate_id: candId,
-            query_id: query.id,
-            first_seen_at: post.created_at,
-            post_count: 1,
-            unique_author_count: 1,
-            is_first_discovery: true,
-            created_at: now,
-            updated_at: now
-          };
-          await currentStore.saveCandidateQueryEvidence(evidence);
-        }
+        const candResult = await createOrMergeCandidateForPost(post, query.id, currentStore);
+        if (candResult.created) candidatesCreated++;
+        if (candResult.updated) candidatesUpdated++;
       }
     }
 
@@ -617,6 +755,7 @@ export async function runQuery(
 export interface BatchRunResult {
   results: RunQueryResult[];
   budget_usage: RunBudgetUsage;
+  pending_recovery?: ProcessPendingExtractionsResult;
 }
 
 export async function runBatchQueries(
@@ -625,6 +764,7 @@ export async function runBatchQueries(
     store?: Store;
     customClient?: XSearchClient;
     budget?: RunBudget;
+    geminiExtractor?: GeminiExtractorFn;
   } = {}
 ): Promise<BatchRunResult> {
   const currentStore = options.store || defaultStore;
@@ -632,7 +772,7 @@ export async function runBatchQueries(
   const queries = await currentStore.getQueries();
   const now = Date.now();
 
-  const toRun = queries.filter(q => {
+  const eligibleQueries = queries.filter(q => {
     if (!q.enabled) return false;
     if (filter === 'P1') return q.priority === 'P1';
     if (filter === 'DUE') {
@@ -641,6 +781,38 @@ export async function runBatchQueries(
       return elapsedMinutes >= (q.run_frequency_minutes || 120);
     }
     return true; // 'ENABLED' or undefined
+  });
+
+  // 3. FAIR QUERY SCHEDULING:
+  // Sort eligible queries by scheduling priority (overdueRatio descending)
+  // overdueRatio = (now - last_run_at) / run_frequency_minutes
+  // Queries never run before have highest priority (Infinity), then oldest / most overdue first.
+  const toRun = [...eligibleQueries].sort((a, b) => {
+    const getOverdueRatio = (q: typeof a) => {
+      if (!q.last_run_at) return Infinity;
+      const elapsedMinutes = (now - new Date(q.last_run_at).getTime()) / (1000 * 60);
+      const freq = q.run_frequency_minutes || 120;
+      return elapsedMinutes / Math.max(1, freq);
+    };
+
+    const ratioA = getOverdueRatio(a);
+    const ratioB = getOverdueRatio(b);
+
+    if (ratioA === Infinity && ratioB === Infinity) {
+      if (a.priority !== b.priority) {
+        return a.priority === 'P1' ? -1 : 1;
+      }
+      return (a.name || a.id).localeCompare(b.name || b.id);
+    }
+
+    if (Math.abs(ratioB - ratioA) < 1e-9) {
+      const timeA = a.last_run_at ? new Date(a.last_run_at).getTime() : 0;
+      const timeB = b.last_run_at ? new Date(b.last_run_at).getTime() : 0;
+      if (timeA !== timeB) return timeA - timeB; // oldest run first
+      return (a.name || a.id).localeCompare(b.name || b.id);
+    }
+
+    return ratioB - ratioA;
   });
 
   // Global RunBudget shared across all queries in this batch
@@ -659,6 +831,14 @@ export async function runBatchQueries(
     initialGemini
   };
 
+  // 1. PENDING EXTRACTION RECOVERY:
+  // Process oldest pending extractions first using the shared Gemini RunBudget
+  const pendingRecovery = await processPendingExtractions({
+    store: currentStore,
+    budget,
+    geminiExtractor: options.geminiExtractor
+  });
+
   const results: RunQueryResult[] = [];
   let stoppedEarlyReason: string | undefined = undefined;
 
@@ -667,7 +847,8 @@ export async function runBatchQueries(
       stoppedEarlyReason = 'GLOBAL_REQUESTS_BUDGET_EXHAUSTED';
       break;
     }
-    if (budget.postsRemaining <= 0) {
+    // 2. STRICT GLOBAL POST BUDGET: If postsRemaining < 10, stop cleanly
+    if (budget.postsRemaining < 10) {
       stoppedEarlyReason = 'GLOBAL_POSTS_BUDGET_EXHAUSTED';
       break;
     }
@@ -676,7 +857,8 @@ export async function runBatchQueries(
       const res = await runQuery(q.id, {
         store: currentStore,
         customClient: options.customClient,
-        budget
+        budget,
+        geminiExtractor: options.geminiExtractor
       });
       results.push(res);
     } catch (err: any) {
@@ -705,7 +887,7 @@ export async function runBatchQueries(
     stopped_early_reason: stoppedEarlyReason
   };
 
-  return { results, budget_usage: budgetUsage };
+  return { results, budget_usage: budgetUsage, pending_recovery: pendingRecovery };
 }
 
 export async function seedAndRunMockWorkflow(targetStore?: Store): Promise<void> {
